@@ -1,0 +1,7 @@
+torch
+torchvision
+torchaudio
+matplotlib
+scipy
+python3-tk
+transformers
