@@ -1,7 +1,8 @@
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
 
-def moving_avg(x, k=1):
+
+def moving_avg(x, k=400):
     return np.convolve(x, np.ones(k)/k, mode='valid')
 
 def plot_comparison(save_path='plots/actor_comparison.png'):
@@ -15,7 +16,7 @@ def plot_comparison(save_path='plots/actor_comparison.png'):
             print(f"Loaded {name} rewards: {len(rewards)} episodes")
             
             # Use smaller window for moving average if data is short
-            window_size = 10
+            window_size = 1000
             if len(rewards) > window_size:
                 smoothed_rewards = moving_avg(rewards, k=window_size)
                 plt.plot(smoothed_rewards, label=f'DDPG-{name} (smoothed)', linewidth=2.5, color=color)
@@ -36,5 +37,5 @@ def plot_comparison(save_path='plots/actor_comparison.png'):
     print(f"Comparison plot saved to '{save_path}'")
     plt.show()
 
-if __name__ == "__main__":
-    plot_comparison() 
+# Generate the final comparison plot
+plot_comparison()

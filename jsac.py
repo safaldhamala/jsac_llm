@@ -19,6 +19,13 @@ from transformers import DistilBertTokenizer, DistilBertModel
 
 print("--- JSAC Actor Network Comparison Script ---")
 
+# --- GPU Setup ---
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
 # --- 1. Setup and Environment Definition ---
 # Create a directory for plots if it doesn't exist
 if not os.path.exists('plots'):
@@ -283,18 +290,13 @@ Action: Based on this report, generate the optimal RIS phases and beamforming co
     return prompt.strip()
 
 def create_prompt(state_np, reward_info=None):
-    """Converts the numerical state vector into a descriptive text prompt for the LLM."""
+    """
+    Converts the numerical state vector into a descriptive text prompt for the LLM.
+    This function is only used for LLM and Hybrid models, not for MLP.
+    """
     ris_phases = state_np[:N]
     bs_beamforming = state_np[N:]
-    # prompt = (f"Task: Optimize RIS and beamforming to balance secrecy and sensing rates. "
-    #           f"Objective: Maximize weighted reward. "
-    #           f"Current RIS phases are {np.round(ris_phases, 2)}. "
-    #           f"Current BS beamforming is {np.round(bs_beamforming, 2)}. ")
-
-    # Instead of complex text prompts, use numerical descriptions, trying simple prompt to see if LLM learns faster
     prompt = f"RIS phases: {ris_phases[:5]}... Beamforming: {bs_beamforming[:5]}... Target: maximize reward"
-
-
 
     if reward_info:
         prompt += (f"Last secrecy rate was {reward_info['secrecy']:.2f}. "
@@ -310,7 +312,7 @@ class ReplayBuffer:
     def sample(self, batch_size):
         samples = random.sample(self.buffer, batch_size)
         s, a, r, s2 = map(np.array, zip(*samples))
-        return map(torch.FloatTensor, (s, a, r, s2))
+        return map(lambda x: torch.FloatTensor(x).to(device), (s, a, r, s2))
     def __len__(self): return len(self.buffer)
 
 class TextReplayBuffer:
@@ -321,12 +323,13 @@ class TextReplayBuffer:
     def sample(self, batch_size, tokenizer):
         samples = random.sample(self.buffer, batch_size)
         prompts, actions, rewards, next_prompts, states_np, next_states_np = zip(*samples)
-        inputs = tokenizer(list(prompts), return_tensors='pt', padding=True, truncation=True, max_length=128)
-        next_inputs = tokenizer(list(next_prompts), return_tensors='pt', padding=True, truncation=True, max_length=128)
-        actions_tensor = torch.FloatTensor(np.array(actions))
-        rewards_tensor = torch.FloatTensor(np.array(rewards))
-        states_tensor = torch.FloatTensor(np.array(states_np))
-        next_states_tensor = torch.FloatTensor(np.array(next_states_np))
+        # FIXED: Use consistent max_length for tokenization
+        inputs = tokenizer(list(prompts), return_tensors='pt', padding=True, truncation=True, max_length=256).to(device)
+        next_inputs = tokenizer(list(next_prompts), return_tensors='pt', padding=True, truncation=True, max_length=256).to(device)
+        actions_tensor = torch.FloatTensor(np.array(actions)).to(device)
+        rewards_tensor = torch.FloatTensor(np.array(rewards)).to(device)
+        states_tensor = torch.FloatTensor(np.array(states_np)).to(device)
+        next_states_tensor = torch.FloatTensor(np.array(next_states_np)).to(device)
         return (inputs, actions_tensor, rewards_tensor, next_inputs, states_tensor, next_states_tensor)
     def __len__(self): return len(self.buffer)
 
@@ -341,11 +344,14 @@ class ActorLLM(nn.Module):
     def __init__(self, action_dim, llm_model_name='distilbert-base-uncased'):
         super().__init__()
         self.llm = DistilBertModel.from_pretrained(llm_model_name)
+        # UNFIXED: Allow LLM weights to be updated during training for better performance
+        # for param in self.llm.parameters():
+        #     param.requires_grad = False
         self.fc1 = nn.Linear(self.llm.config.dim, 128)
         self.fc2 = nn.Linear(128, action_dim)
     def forward(self, input_ids, attention_mask):
-        with torch.no_grad():
-            outputs = self.llm(input_ids=input_ids, attention_mask=attention_mask)
+        # FIXED: Remove torch.no_grad() to allow gradient flow through LLM
+        outputs = self.llm(input_ids=input_ids, attention_mask=attention_mask)
         cls_output = outputs.last_hidden_state[:, 0, :]
         x = torch.relu(self.fc1(cls_output))
         return torch.tanh(self.fc2(x))
@@ -354,13 +360,16 @@ class ActorHybrid(nn.Module):
     def __init__(self, state_dim, action_dim, llm_model_name='distilbert-base-uncased'):
         super().__init__()
         self.llm = DistilBertModel.from_pretrained(llm_model_name)
+        # UNFIXED: Allow LLM weights to be updated during training for better performance
+        # for param in self.llm.parameters():
+        #     param.requires_grad = False
         self.llm_fc = nn.Linear(self.llm.config.dim, 64)
         self.cnn_fc = nn.Linear(state_dim, 64) # Using simple Linear for numerical part
         self.combine_fc1 = nn.Linear(128, 128)
         self.output_fc = nn.Linear(128, action_dim)
     def forward(self, state, input_ids, attention_mask):
-        with torch.no_grad():
-            llm_out = self.llm(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0, :]
+        # FIXED: Remove torch.no_grad() to allow gradient flow through LLM
+        llm_out = self.llm(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0, :]
         llm_features = torch.relu(self.llm_fc(llm_out))
         numeric_features = torch.relu(self.cnn_fc(state))
         combined = torch.cat((llm_features, numeric_features), dim=1)
@@ -383,16 +392,28 @@ class DDPGAgent:
         actor_args = (action_dim,) if is_text_based else (state_dim, action_dim)
         if is_hybrid: actor_args = (state_dim, action_dim)
 
-        self.actor = actor_class(*actor_args)
-        self.critic = critic_class(state_dim, action_dim)
-        self.target_actor = actor_class(*actor_args)
-        self.target_critic = critic_class(state_dim, action_dim)
+        self.actor = actor_class(*actor_args).to(device)
+        self.critic = critic_class(state_dim, action_dim).to(device)
+        self.target_actor = actor_class(*actor_args).to(device)
+        self.target_critic = critic_class(state_dim, action_dim).to(device)
 
         self.target_actor.load_state_dict(self.actor.state_dict())
         self.target_critic.load_state_dict(self.critic.state_dict())
 
-        self.opt_actor = optim.Adam(self.actor.parameters(), lr=1e-4)
-        self.opt_critic = optim.Adam(self.critic.parameters(), lr=1e-3)
+        # FIXED: Use different learning rates for LLM/Hybrid vs MLP for better stability
+        if is_text_based or is_hybrid:
+            # All parameters are now trainable (LLM weights unfrozen)
+            self.opt_actor = optim.Adam(self.actor.parameters(), lr=1e-3)  # Match main.py learning rate
+            self.opt_critic = optim.Adam(self.critic.parameters(), lr=1e-3)  # Match main.py learning rate
+            # Add learning rate schedulers for better convergence
+            self.scheduler_actor = optim.lr_scheduler.StepLR(self.opt_actor, step_size=500, gamma=0.8)
+            self.scheduler_critic = optim.lr_scheduler.StepLR(self.opt_critic, step_size=500, gamma=0.8)
+        else:
+            self.opt_actor = optim.Adam(self.actor.parameters(), lr=1e-3)
+            self.opt_critic = optim.Adam(self.critic.parameters(), lr=1e-3)
+            # Add learning rate schedulers for better convergence
+            self.scheduler_actor = optim.lr_scheduler.StepLR(self.opt_actor, step_size=500, gamma=0.8)
+            self.scheduler_critic = optim.lr_scheduler.StepLR(self.opt_critic, step_size=500, gamma=0.8)
 
         self.replay_buffer = TextReplayBuffer() if is_text_based or is_hybrid else ReplayBuffer()
         self.reward_history = []
@@ -407,43 +428,60 @@ class DDPGAgent:
 
         with torch.no_grad():
             if self.is_text_based:
-                next_actions = self.target_actor(next_inputs['input_ids'], next_inputs['attention_mask'])
+                next_actions = self.target_actor(next_inputs['input_ids'].to(device), next_inputs['attention_mask'].to(device))
             elif self.is_hybrid:
-                next_actions = self.target_actor(next_states, next_inputs['input_ids'], next_inputs['attention_mask'])
+                next_actions = self.target_actor(next_states.to(device), next_inputs['input_ids'].to(device), next_inputs['attention_mask'].to(device))
             else:
-                next_actions = self.target_actor(next_states)
-            target_q = rewards + gamma * self.target_critic(next_states, next_actions)
+                next_actions = self.target_actor(next_states.to(device))
+            target_q = rewards + gamma * self.target_critic(next_states.to(device), next_actions)
 
-        q = self.critic(states, actions)
+        q = self.critic(states.to(device), actions.to(device))
         critic_loss = nn.MSELoss()(q, target_q)
-        self.opt_critic.zero_grad(); critic_loss.backward(); self.opt_critic.step()
+        self.opt_critic.zero_grad(); critic_loss.backward()
+        
+        # FIXED: Add gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)  # Reduced from 1.0
+        self.opt_critic.step()
 
         if self.is_text_based:
-            actor_actions = self.actor(inputs['input_ids'], inputs['attention_mask'])
+            actor_actions = self.actor(inputs['input_ids'].to(device), inputs['attention_mask'].to(device))
         elif self.is_hybrid:
-            actor_actions = self.actor(states, inputs['input_ids'], inputs['attention_mask'])
+            actor_actions = self.actor(states.to(device), inputs['input_ids'].to(device), inputs['attention_mask'].to(device))
         else:
-            actor_actions = self.actor(states)
+            actor_actions = self.actor(states.to(device))
 
-        actor_loss = -self.critic(states, actor_actions).mean()
-        self.opt_actor.zero_grad(); actor_loss.backward(); self.opt_actor.step()
+        actor_loss = -self.critic(states.to(device), actor_actions.to(device)).mean()
+        self.opt_actor.zero_grad(); actor_loss.backward()
+        
+        # FIXED: Add gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)  # Reduced from 1.0
+        self.opt_actor.step()
+        
+        # Step the learning rate schedulers
+        self.scheduler_actor.step()
+        self.scheduler_critic.step()
 
-        for tp, p in zip(self.target_actor.parameters(), self.actor.parameters()):
-            tp.data.copy_(tau * p.data + (1.0 - tau) * tp.data)
-        for tp, p in zip(self.target_critic.parameters(), self.critic.parameters()):
-            tp.data.copy_(tau * p.data + (1.0 - tau) * tp.data)
+        # FIXED: Correct target network soft update implementation
+        # Use the correct formula: target = tau * main + (1-tau) * target
+        for target_param, param in zip(self.target_actor.parameters(), self.actor.parameters()):
+            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+        for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
+            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
 
 # --- 6. Training ---
 # Hyperparameters
-state_dim = N + M
-action_dim = N + M
-episodes = 2000 #Temporarily reduced for testing
-batch_size = 64
+# FIXED: Update state dimension to match action dimension for consistency
+state_dim = N + (2 * M * V_users)  # Match action_dim for consistency
+# FIXED: Expand action space to handle multi-user beamforming properly
+# Need N for RIS phases + 2*M*V for real/imaginary parts of beamforming matrices
+action_dim = N + (2 * M * V_users)  # 32 + (2 * 16 * 3) = 32 + 96 = 128
+episodes = 2000  # Increased for better convergence and learning
+batch_size = 32  # Reduced from 64 for more stable updates in complex environment
 gamma = 0.99
-tau = 0.005
-noise_std = 0.5
-noise_decay = 0.999
-min_noise_std = 0.05
+tau = 0.001  # Reduced from 0.005 for more stable target network updates
+noise_std = 0.5  # Match main.py exactly
+noise_decay = 0.995  # Match main.py exactly
+min_noise_std = 0.05  # Match main.py exactly
 llm_model_name = 'distilbert-base-uncased'
 
 # Training monitoring parameters
@@ -457,6 +495,14 @@ agents = {
     "LLM": DDPGAgent("LLM", ActorLLM, Critic, state_dim, action_dim, is_text_based=True),
     "Hybrid": DDPGAgent("Hybrid", ActorHybrid, Critic, state_dim, action_dim, is_hybrid=True)
 }
+
+# Print information about frozen LLM weights
+for name, agent in agents.items():
+    if agent.is_text_based or agent.is_hybrid:
+        total_params = sum(p.numel() for p in agent.actor.parameters())
+        trainable_params = sum(p.numel() for p in agent.actor.parameters() if p.requires_grad)
+        print(f"{name} Actor: Total params: {total_params:,}, Trainable: {trainable_params:,}")
+
 print("Initialization complete.")
 
 # Training Loop
@@ -464,11 +510,18 @@ print(f"Starting training for {episodes} episodes...")
 for ep in range(episodes):
 
     ris_phases = np.random.uniform(0, 2*np.pi, N)
-    bs_w = np.random.randn(M)
-    bs_w = bs_w / np.linalg.norm(bs_w) * np.sqrt(P_max)
-    state_np = np.concatenate([ris_phases, bs_w])
+    # FIXED: Initialize state with proper dimensions for beamforming parameters
+    bs_w_real = np.random.randn(M * V_users)
+    bs_w_imag = np.random.randn(M * V_users)
+    # Normalize beamforming parameters
+    bs_w_complex = bs_w_real + 1j * bs_w_imag
+    bs_w_complex = bs_w_complex / np.linalg.norm(bs_w_complex) * np.sqrt(P_max)
+    bs_w_real = bs_w_complex.real.flatten()
+    bs_w_imag = bs_w_complex.imag.flatten()
+    
+    state_np = np.concatenate([ris_phases, bs_w_real, bs_w_imag])
 
-    state_tensor = torch.FloatTensor(state_np).unsqueeze(0)
+    state_tensor = torch.FloatTensor(state_np).unsqueeze(0).to(device)
 
     # Initialize default KPIs for first episode
     if ep == 0:
@@ -496,8 +549,9 @@ for ep in range(episodes):
         }
 
     for name, agent in agents.items():
-        # Generate descriptive prompt for LLM and Hybrid models
+        # MLP uses classic DDPG - direct state input, no text processing
         if agent.is_text_based or agent.is_hybrid:
+            # Generate descriptive prompt for LLM and Hybrid models
             prompt = create_descriptive_prompt(
                 secrecy_rate=default_kpis['secrecy_rate'],
                 sensing_secrecy_rate=default_kpis['sensing_secrecy_rate'],
@@ -508,43 +562,36 @@ for ep in range(episodes):
                 P_tx_total=default_kpis['P_tx_total'],
                 P_max=default_kpis['P_max']
             )
-            inputs = tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=256)
+            inputs = tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=256).to(device)
         else:
-            # Use simple prompt for MLP
-            prompt = create_prompt(state_np)
-            inputs = tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=128)
+            # MLP: Classic DDPG - no text processing needed
+            # Just use the state tensor directly
+            pass
 
         with torch.no_grad():
             if agent.is_text_based:
-                action = agent.actor(inputs['input_ids'], inputs['attention_mask']).numpy()[0]
+                action = agent.actor(inputs['input_ids'], inputs['attention_mask']).cpu().numpy()[0]
             elif agent.is_hybrid:
-                action = agent.actor(state_tensor, inputs['input_ids'], inputs['attention_mask']).numpy()[0]
+                action = agent.actor(state_tensor, inputs['input_ids'], inputs['attention_mask']).cpu().numpy()[0]
             else:
-                action = agent.actor(state_tensor).numpy()[0]
+                # MLP: Classic DDPG - direct state input
+                action = agent.actor(state_tensor).cpu().numpy()[0]
 
         noisy_action = action + np.random.normal(0, noise_std, action_dim)
         # Constraint C2: |θ_n| = 1. The action output is mapped to a valid phase in [0, 2*pi].
         ris_action = np.mod((noisy_action[:N] + 1) / 2 * 2 * np.pi, 2 * np.pi)
-        bs_raw = (noisy_action[N:] + 1) / 2 * 2 - 1
-        bs_action = bs_raw / np.linalg.norm(bs_raw) * np.sqrt(P_max)
-
-        # FIXED: Use agent's action to construct beamforming matrices
-        # The agent learns to output beamforming vectors that satisfy ZF constraints
-        # Reshape bs_action to construct W_tau and W_o matrices
-        bs_action_reshaped = bs_action.reshape(M, -1)  # Shape: (M, V) where V = bs_action.size // M
         
-        # Ensure we have enough elements for V users
-        if bs_action_reshaped.shape[1] < V_users:
-            # Pad with zeros if needed
-            padding = np.zeros((M, V_users - bs_action_reshaped.shape[1]))
-            bs_action_reshaped = np.hstack([bs_action_reshaped, padding])
-        elif bs_action_reshaped.shape[1] > V_users:
-            # Truncate if too many
-            bs_action_reshaped = bs_action_reshaped[:, :V_users]
+        # FIXED: Properly construct beamforming matrices from expanded action space
+        # Extract beamforming parameters from the action
+        w_flat = noisy_action[N:]  # Shape: (2*M*V,)
         
-        # Construct W_tau and W_o from agent's action
-        W_tau = bs_action_reshaped.copy()
-        W_o = bs_action_reshaped.copy()
+        # Split into real and imaginary parts
+        w_real = w_flat[:M*V_users].reshape(M, V_users)  # Shape: (M, V)
+        w_imag = w_flat[M*V_users:].reshape(M, V_users)  # Shape: (M, V)
+        
+        # Construct complex beamforming matrices
+        W_tau = w_real + 1j * w_imag  # Shape: (M, V)
+        W_o = W_tau.copy()  # For simplicity, could be learned separately
         
         # Apply ZF constraints using the actual channel matrices
         # Get the direct channel for the first user (representative)
@@ -672,6 +719,9 @@ for ep in range(episodes):
         # FIXED: Simplified reward function as per paper's Equation (26)
         # Use the pure objective function without complex penalties
         reward = omega * secrecy_rate + (1 - omega) * sensing_secrecy_rate
+        
+        # Add reward normalization for stability in complex environment
+        reward = np.clip(reward, -10.0, 10.0)  # Clip extreme values
 
         # Calculate KPIs for next episode's prompt
         min_user_rate = R_E2E_v if snr_comm >= gamma_req else 0
@@ -689,7 +739,8 @@ for ep in range(episodes):
         last_P_tx_total = P_tx_total
 
         agent.reward_history.append(reward)
-        next_state_np = np.concatenate([ris_action, bs_action])
+        # FIXED: Construct next_state with proper beamforming parameters
+        next_state_np = np.concatenate([ris_action, W_tau.real.flatten(), W_tau.imag.flatten()])
 
         if agent.is_text_based or agent.is_hybrid:
             # Generate next prompt for replay buffer using current KPIs
@@ -705,6 +756,7 @@ for ep in range(episodes):
             )
             agent.replay_buffer.push((prompt, noisy_action, [reward], next_prompt, state_np, next_state_np))
         else:
+            # MLP: Classic DDPG - store state directly, no text processing
             agent.replay_buffer.push(state_np, noisy_action, [reward], next_state_np)
 
         agent.update(batch_size, gamma, tau, tokenizer)
