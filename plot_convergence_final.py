@@ -16,7 +16,7 @@ def plot_comparison(save_path='plots/actor_comparison.png'):
             print(f"Loaded {name} rewards: {len(rewards)} episodes")
             
             # Use smaller window for moving average if data is short
-            window_size = 1000
+            window_size = 3900
             if len(rewards) > window_size:
                 smoothed_rewards = moving_avg(rewards, k=window_size)
                 plt.plot(smoothed_rewards, label=f'DDPG-{name} (smoothed)', linewidth=2.5, color=color)
