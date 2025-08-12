@@ -16,7 +16,7 @@ def plot_comparison(save_path='plots/actor_comparison.png'):
             print(f"Loaded {name} rewards: {len(rewards)} episodes")
             
             # Use smaller window for moving average if data is short
-            window_size = 3900
+            window_size = 300
             if len(rewards) > window_size:
                 smoothed_rewards = moving_avg(rewards, k=window_size)
                 plt.plot(smoothed_rewards, label=f'DDPG-{name} (smoothed)', linewidth=2.5, color=color)
@@ -28,10 +28,11 @@ def plot_comparison(save_path='plots/actor_comparison.png'):
             print(f"Warning: 'plots/{name}_rewards.npy' not found. Skipping.")
 
     plt.xlabel('Episode', fontsize=14)
-    plt.ylabel('Reward (Weighted Rate)', fontsize=14)
-    plt.title('DDPG Actor Architecture Comparison (Secrecy vs. Sensing)', fontsize=16)
+    plt.ylabel('Reward (Communication Secrecy Rate)', fontsize=14)
+    plt.title('DDPG Actor Architecture Comparison (Communication Secrecy)', fontsize=16)
     plt.legend(fontsize=12)
     plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.ylim(bottom=0)
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     print(f"Comparison plot saved to '{save_path}'")
