@@ -1,28 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-JSAC Reinforcement Learning with LLM/Hybrid Actors - Communication Secrecy Version
-
-This implementation demonstrates successful hyperparameter tuning for LLM and Hybrid
-DDPG agents in complex communication secrecy environments. Key improvements include:
-
-✅ LLM Stability: Fixed regression issues with conservative learning rates (5e-5, 1e-4)
-✅ Hybrid Dominance: Achieved best overall performance (0.5969 mean reward)
-✅ Training Stability: No dramatic drops throughout 2000 episodes
-✅ Clear Hierarchy: Hybrid > MLP > LLM performance established
-
-Hyperparameter Strategy:
-- LLM/Hybrid: Conservative learning, small batches (16), tight gradients (0.3), slow updates (tau=0.0005)
-- MLP: Standard learning, larger batches (32), normal gradients (0.5), faster updates (tau=0.001)
-- Warmup scheduling for LLM stability (200 episodes)
-- Weight decay regularization (1e-4) to prevent overfitting
-
-Results (2000 episodes):
-- Hybrid: 0.5969 mean, 3.7056 peak, 29.0% consistency
-- MLP: 0.5643 mean, 3.9950 peak, 27.2% consistency  
-- LLM: 0.5638 mean, 3.4050 peak, 27.2% consistency
-
-Environment: Complex multi-user beamforming (128D actions) with RIS/communication constraints
-"""
 
 import numpy as np
 import torch
@@ -59,6 +34,7 @@ N, M = 32, 16 #######################################from 4,2
 sigma2 = 1e-14 ############################################from 0.1
 P_max = 1
 snr_min = 1e-8
+omega = 0.5 #####################################from 0.5
 beta, B = 0.8, 1.0 #########################################################from 0.8,1.0
 
 # --- IEEE-Based Multi-Link Pathloss Initialization ---
@@ -221,11 +197,48 @@ def compute_eve_snr(phases, w):
     snr_e = np.abs(eff_e)**2 / sigma2
     return _scalar(snr_e)
 
+# Equation (19) - SNR for Target Echo at IAB Node (Γ_i^(s)).
+# Computes the sensing SNR based on the echo received from the target.
+def compute_sensing_snr(W_tau, W_o, phases, sigma_i=0.1):
+    """Compute radar-style sensing SNR at IAB node based on echo from target g"""
 
+    # RIS-assisted channel to target (LoS model)
+    phi_sg = 1
+    d_sg = abs(ris_pos - 60)  # assume target g at 60m
+    pl_sg = compute_pathloss(d_sg)
+    h_sg = np.array([np.exp(-1j * 2 * np.pi / lambda_c * n * d_sg * phi_sg) for n in range(N)]).reshape(1, -1)
+    h_sg = h_sg / np.sqrt(pl_sg)
+
+    # IAB-to-target direct path
+    f_direct = (np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)
+
+    # RIS-assisted path
+    # Equation (1) - RIS diagonal reflection matrix (Θ).
+    theta = np.exp(1j * phases)
+    Theta = np.diag(theta)
+    H_is = H_br  # reuse from earlier
+    f_ris = (h_sg @ Theta @ H_is).reshape(M, 1)
+
+    # Composite channel F_i_g = f f^H + f_tilde f_tilde^H (defined in text before Eq. 19)
+    F1 = f_direct @ f_direct.conj().T
+    F2 = f_ris @ f_ris.conj().T
+    F_ig = F1 + F2
+
+    # Radar receive vector (unit-norm) - corresponds to 'u' in Eq. 19
+    u = np.random.randn(M, 1) + 1j * np.random.randn(M, 1)
+    # Constraint C8: ||u||^2 = 1
+    u = u / np.linalg.norm(u)
+
+    # Composite transmit power matrix
+    P_tx = W_tau @ W_tau.conj().T + W_o @ W_o.conj().T
+
+    # SNR calculation as per Equation (19)
+    snr_sense = (u.conj().T @ F_ig @ P_tx @ F_ig.conj().T @ u).real / sigma_i**2
+    return _scalar(snr_sense)
 
 
 # --- 2. Prompt Engineering for LLM ---
-def create_descriptive_prompt(secrecy_rate, min_user_rate, rate_eve, P_tx_total, P_max):
+def create_descriptive_prompt(secrecy_rate, sensing_secrecy_rate, min_user_rate, rate_eve, rate_sense_iab, rate_sense_eve, P_tx_total, P_max):
     """
     Creates a descriptive, high-level prompt for the LLM based on system KPIs,
     following the principles of the reference paper.
@@ -233,28 +246,38 @@ def create_descriptive_prompt(secrecy_rate, min_user_rate, rate_eve, P_tx_total,
     
     # Analyze the current state to provide a high-level summary
     comm_status = "GOOD" if secrecy_rate > 0.5 else "POOR"
+    sens_status = "GOOD" if sensing_secrecy_rate > 2.0 else "POOR"
     
-    if comm_status == "GOOD":
+    if comm_status == "GOOD" and sens_status == "GOOD":
         hint = "System is performing well. Maintain performance or explore minor improvements."
-    else:
-        hint = "Communication secrecy is low. Prioritize increasing the user's rate or reducing the eavesdropper's rate."
+    elif comm_status == "POOR":
+        hint = "Communication secrecy is low. Prioritize increasing the users' rate or reducing the eavesdropper's rate."
+    else: # Sensing status is poor
+        hint = "Sensing privacy is low. Prioritize increasing the IAB node's sensing rate or reducing the eavesdropper's sensing rate."
 
     prompt = f"""
-Task: Optimize secure communication by adjusting RIS phases and beamforming.
-Objective: Maximize the communication secrecy rate for users.
+Task: Optimize secure and private communication by adjusting RIS phases and beamforming.
+Objective: Maximize a weighted balance between communication secrecy for users and sensing privacy from an eavesdropper.
 
 --- SYSTEM STATUS REPORT ---
 Overall Hint: {hint}
 
 [COMMUNICATION STATUS]
-- User's End-to-End Rate: {min_user_rate:.2f}
+- Users' End-to-End Rate: {min_user_rate:.2f}
 - Eavesdropper's Rate: {rate_eve:.2f}
+- Performance Analysis: Communication secrecy is currently {comm_status}.
 - Final Communication Secrecy Rate: {secrecy_rate:.2f}
+
+[SENSING STATUS]
+- IAB Node's Sensing Rate: {rate_sense_iab:.2f}
+- Eavesdropper's Sensing Rate: {rate_sense_eve:.2f}
+- Performance Analysis: Sensing privacy is currently {sens_status}.
+- Final Sensing Secrecy Rate: {sensing_secrecy_rate:.2f}
 
 [CONSTRAINTS]
 - Total Transmit Power: {P_tx_total:.2f} / {P_max:.2f}
 
-Action: Based on this report, generate the optimal RIS phases and beamforming configuration.
+Action: Based on this report, generate the optimal RIS phases and beamforming configuration to improve the overall reward.
 """
     return prompt.strip()
 
@@ -268,7 +291,8 @@ def create_prompt(state_np, reward_info=None):
     prompt = f"RIS phases: {ris_phases[:5]}... Beamforming: {bs_beamforming[:5]}... Target: maximize reward"
 
     if reward_info:
-        prompt += f"Last secrecy rate was {reward_info['secrecy']:.2f}."
+        prompt += (f"Last secrecy rate was {reward_info['secrecy']:.2f}. "
+                   f"Last sensing rate was {reward_info['sensing']:.2f}.")
     return prompt
 
 # --- 3. Replay Buffers ---
@@ -472,7 +496,7 @@ state_dim = N + (2 * M * V_users)  # Match action_dim for consistency
 # FIXED: Expand action space to handle multi-user beamforming properly
 # Need N for RIS phases + 2*M*V for real/imaginary parts of beamforming matrices
 action_dim = N + (2 * M * V_users)  # 32 + (2 * 16 * 3) = 32 + 96 = 128
-episodes = 1000  # Increased for better convergence and learning
+episodes = 4000  # Increased for better convergence and learning
 batch_size = 16  # Reduced for LLM/Hybrid stability, MLP will use larger batches
 batch_size_mlp = 32  # Separate batch size for MLP
 gamma = 0.99
@@ -487,7 +511,7 @@ min_noise_std_mlp = 0.05  # Separate minimum noise for MLP
 llm_model_name = 'distilbert-base-uncased'
 
 # Training monitoring parameters
-avg_window_size = 200  # Number of episodes to average for performance monitoring (can be changed to 50, 60, etc.)
+avg_window_size = 100  # Number of episodes to average for performance monitoring (can be changed to 50, 60, etc.)
 
 # Initialize Tokenizer and Agents
 print("Initializing tokenizer and agents...")
@@ -529,8 +553,11 @@ for ep in range(episodes):
     if ep == 0:
         default_kpis = {
             'secrecy_rate': 0.5,
+            'sensing_secrecy_rate': 1.0,
             'min_user_rate': 1.0,
             'rate_eve': 0.8,
+            'rate_sense_iab': 2.0,
+            'rate_sense_eve': 1.0,
             'P_tx_total': 0.5,
             'P_max': P_max
         }
@@ -538,8 +565,11 @@ for ep in range(episodes):
         # Use previous episode's KPIs for the prompt
         default_kpis = {
             'secrecy_rate': last_secrecy_rate,
+            'sensing_secrecy_rate': last_sensing_secrecy_rate,
             'min_user_rate': last_min_user_rate,
             'rate_eve': last_rate_eve,
+            'rate_sense_iab': last_rate_sense_iab,
+            'rate_sense_eve': last_rate_sense_eve,
             'P_tx_total': last_P_tx_total,
             'P_max': P_max
         }
@@ -560,8 +590,11 @@ for ep in range(episodes):
             # Generate descriptive prompt for LLM and Hybrid models
             prompt = create_descriptive_prompt(
                 secrecy_rate=default_kpis['secrecy_rate'],
+                sensing_secrecy_rate=default_kpis['sensing_secrecy_rate'],
                 min_user_rate=default_kpis['min_user_rate'],
                 rate_eve=default_kpis['rate_eve'],
+                rate_sense_iab=default_kpis['rate_sense_iab'],
+                rate_sense_eve=default_kpis['rate_sense_eve'],
                 P_tx_total=default_kpis['P_tx_total'],
                 P_max=default_kpis['P_max']
             )
@@ -620,11 +653,14 @@ for ep in range(episodes):
         snr_eve = compute_eve_sinr_maxcase(ris_action, W_tau, W_o)
 
         snr_comm = compute_snr_delayed(ris_action, W_tau, W_o, v_idx=0)
+        snr_sense = compute_sensing_snr(W_tau, W_o, ris_action)
 
         secrecy_rate = 0
+        sensing_rate = 0
         R_v, R_e = 0, 0 # Initialize R_v and R_e to 0
 
         gamma_req = 0.001  # Required SINR in linear scale (~10 dB)
+        gamma_s_min = 2  # Minimum sensing SNR
 
         # Constraint C5: Γ_v >= Γ_req
         # The communication rate is only calculated if the user's SNR meets the requirement.
@@ -658,9 +694,49 @@ for ep in range(episodes):
             secrecy_rate += np.random.uniform(-0.01, 0.01)
             secrecy_rate = max(0, secrecy_rate)  # Ensure secrecy rate stays non-negative
 
+        # Constraint C6: Γ_i^(s) >= Γ_s_req
+        # The sensing rate is calculated if the sensing SNR meets the requirement.
+        if snr_sense >= gamma_s_min:
+            # Definition of sensing rate from the paper, following Eq. (24)
+            sensing_rate = beta * B * np.log2(1 + max(snr_sense, snr_min))
 
+        # This section calculates the sensing SNR at the eavesdropper, which is conceptually
+        # related to Equation (24), which defines the SNR of the sensing signal at the eavesdropper.
+        d_ge = abs(60 - eve_pos)
+        pl_ge = compute_pathloss(d_ge)
+        h_ge = np.array([np.exp(-1j * 2 * np.pi / lambda_c * n * d_ge) for n in range(N)]).reshape(1, -1)
+        h_ge = h_ge / np.sqrt(pl_ge)
 
+        theta = np.exp(1j * ris_action)
+        Theta = np.diag(theta)
 
+        # RIS-assisted echo path
+        H_is = H_br
+        f_ris_e = (h_ge @ Theta @ H_is).reshape(M, 1)
+
+        # Direct path
+        f_direct_e = (np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)
+
+        # Composite channel
+        F1_e = f_direct_e @ f_direct_e.conj().T
+        F2_e = f_ris_e @ f_ris_e.conj().T
+        F_ge = F1_e + F2_e
+
+        # Same transmit matrix as before
+        P_tx = W_tau @ W_tau.conj().T + W_o @ W_o.conj().T
+        sigma_e = 0.1  # same noise power
+
+        # Radar receive vector
+        u_e = np.random.randn(M, 1) + 1j * np.random.randn(M, 1)
+        u_e = u_e / np.linalg.norm(u_e)
+
+        snr_sense_eve = (u_e.conj().T @ F_ge @ P_tx @ F_ge.conj().T @ u_e).real / sigma_e**2
+
+        R_sense_eve = beta * B * np.log2(1 + max(_scalar(snr_sense_eve), snr_min))
+        R_sense_i = sensing_rate
+        # Equation (25) - Sensing secrecy rate (S^(s)).
+        # This is also related to Constraint C10: S^(s) > 0.
+        sensing_secrecy_rate = max(R_sense_i - R_sense_eve, 0)
 
         # if secrecy_rate == 0 and snr_comm >= gamma_req:
         #     R_v = beta * B * np.log2(1 + max(snr_comm, snr_min))
@@ -674,8 +750,11 @@ for ep in range(episodes):
         # else:
         #     R_v, R_e = 0, 0  # Define default values if condition fails
 
-        # FIXED: Simplified reward function - only communication secrecy
-        reward = secrecy_rate
+        sensing_rate = beta * B * np.log2(1 + max(snr_sense, snr_min))
+        
+        # FIXED: Simplified reward function as per paper's Equation (26)
+        # Use the pure objective function without complex penalties
+        reward = omega * secrecy_rate + (1 - omega) * sensing_secrecy_rate
         
         # Add reward normalization for stability in complex environment
         reward = np.clip(reward, -10.0, 10.0)  # Clip extreme values
@@ -683,11 +762,16 @@ for ep in range(episodes):
         # Calculate KPIs for next episode's prompt
         min_user_rate = R_E2E_v if snr_comm >= gamma_req else 0
         rate_eve = R_e
+        rate_sense_iab = R_sense_i
+        rate_sense_eve = R_sense_eve
 
         # Store KPIs for next episode
         last_secrecy_rate = secrecy_rate
+        last_sensing_secrecy_rate = sensing_secrecy_rate
         last_min_user_rate = min_user_rate
         last_rate_eve = rate_eve
+        last_rate_sense_iab = rate_sense_iab
+        last_rate_sense_eve = rate_sense_eve
         last_P_tx_total = P_tx_total
 
         agent.reward_history.append(reward)
@@ -698,8 +782,11 @@ for ep in range(episodes):
             # Generate next prompt for replay buffer using current KPIs
             next_prompt = create_descriptive_prompt(
                 secrecy_rate=secrecy_rate,
+                sensing_secrecy_rate=sensing_secrecy_rate,
                 min_user_rate=min_user_rate,
                 rate_eve=rate_eve,
+                rate_sense_iab=rate_sense_iab,
+                rate_sense_eve=rate_sense_eve,
                 P_tx_total=P_tx_total,
                 P_max=P_max
             )
@@ -722,7 +809,7 @@ for ep in range(episodes):
             avg_reward = np.mean(agent.reward_history[-avg_window_size:])
             print(f"  - {name}: Last {avg_window_size} Avg Reward = {avg_reward:.4f}")
     if ep < 10:# for first 5 episodes
-        print(f"Ep{ep+1} | SNR_comm={snr_comm:.2e}, SNR_eve={snr_eve:.2e}, R_v={R_v:.4f}, R_e={R_e:.4f}, Secrecy={secrecy_rate:.4f}, Reward={reward:.4f}")
+        print(f"Ep{ep+1} | SNR_comm={snr_comm:.2e}, SNR_eve={snr_eve:.2e}, R_v={R_v:.4f}, R_e={R_e:.4f}, Secrecy={secrecy_rate:.4f}, Sensing={sensing_rate:.4f}, Reward={reward:.4f}")
 
 print("Training finished.")
 
@@ -757,8 +844,8 @@ def plot_comparison(save_path='plots/actor_comparison.png'):
             print(f"Warning: 'plots/{name}_rewards.npy' not found. Skipping.")
 
     plt.xlabel('Episode', fontsize=14)
-    plt.ylabel('Reward (Communication Secrecy Rate)', fontsize=14)
-    plt.title('DDPG Actor Architecture Comparison (Communication Secrecy)', fontsize=16)
+    plt.ylabel('Reward (Weighted Rate)', fontsize=14)
+    plt.title('DDPG Actor Architecture Comparison (Secrecy vs. Sensing)', fontsize=16)
     plt.legend(fontsize=12)
     plt.grid(True, which='both', linestyle='--', linewidth=0.5)
     plt.tight_layout()
