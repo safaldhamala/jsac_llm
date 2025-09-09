@@ -379,13 +379,16 @@ class DDPGAgent:
         else:
             current_batch_size = batch_size * 2  # Use larger batch for MLP
             current_tau = tau * 2  # Use larger tau for MLP
-            
-        if len(self.replay_buffer) < current_batch_size: return
+        # Allow training with smaller batches early in training: use effective batch size
+        min_required = 4 if (self.is_text_based or self.is_hybrid) else 8
+        if len(self.replay_buffer) < min_required:
+            return
+        effective_batch = min(current_batch_size, len(self.replay_buffer))
 
         if self.is_text_based or self.is_hybrid:
-            inputs, actions, rewards, next_inputs, states, next_states = self.replay_buffer.sample(current_batch_size, tokenizer)
+            inputs, actions, rewards, next_inputs, states, next_states = self.replay_buffer.sample(effective_batch, tokenizer)
         else:
-            states, actions, rewards, next_states = self.replay_buffer.sample(current_batch_size)
+            states, actions, rewards, next_states = self.replay_buffer.sample(effective_batch)
 
         with torch.no_grad():
             if self.is_text_based:
@@ -473,8 +476,22 @@ csi_dim = h_iv_dim + h_is_dim + h_sv_dim + h_ris_v_dim + h_ie_dim + h_ris_e_dim 
 state_dim = prev_action_dim + csi_dim
 
 # Expand action space to include amplitudes for hybrid RIS (amplitudes + phases + beamforming)
-action_dim = (N + N) + (2 * M * V_users)  # N phases + N amplitudes + beamforming real/imag
-episodes = 40  # Increased for better convergence and learning
+action_dim = N + (2 * M * V_users)  # passive RIS: N phases + beamforming real/imag
+
+import argparse
+
+# set up argument parser
+parser = argparse.ArgumentParser()
+parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run")
+
+# parse arguments from the command line
+args = parser.parse_args()
+
+episodes = args.episodes
+print(f"Running for {episodes} episodes...")
+
+
+
 batch_size = 16  # Reduced for LLM/Hybrid stability, MLP will use larger batches
 batch_size_mlp = 32  # Separate batch size for MLP
 gamma = 0.99
@@ -626,109 +643,107 @@ for ep in range(episodes):
                 # MLP: Classic DDPG - direct state input
                 action = agent.actor(state_tensor).cpu().numpy()[0]
 
-    noisy_action = action + np.random.normal(0, current_noise_std, action_dim)
+        noisy_action = action + np.random.normal(0, current_noise_std, action_dim)
 
-    # Extract RIS phases and amplitudes for hybrid RIS
-    ris_phase_action = np.mod((noisy_action[:N] + 1) / 2 * 2 * np.pi, 2 * np.pi)
-    A_max = 1.2
-    ris_amplitude_action = (noisy_action[N:2*N] + 1) / 2 * A_max
+        # Extract RIS phases (passive RIS)
+        ris_phase_action = np.mod((noisy_action[:N] + 1) / 2 * 2 * np.pi, 2 * np.pi)
 
-    # Beamforming part follows after 2N entries
-    w_flat = noisy_action[2*N:]
-    w_real = w_flat[:M*V_users].reshape(M, V_users)
-    w_imag = w_flat[M*V_users:].reshape(M, V_users)
-    W_tau = w_real + 1j * w_imag
-    W_o = W_tau.copy()
+        # Beamforming part follows after N entries
+        w_flat = noisy_action[N:]
+        w_real = w_flat[:M*V_users].reshape(M, V_users)
+        w_imag = w_flat[M*V_users:].reshape(M, V_users)
+        W_tau = w_real + 1j * w_imag
+        W_o = W_tau.copy()
 
-    # Representative direct channel for first user (stochastic/imperfect CSI)
-    h_direct = ((np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)).T
+        # Representative direct channel for first user (stochastic/imperfect CSI)
+        h_direct = ((np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)).T
 
-    # RIS reflection with amplitude and phase (hybrid RIS)
-    theta = ris_amplitude_action * np.exp(1j * ris_phase_action)
-    Theta = np.diag(theta)
-    h_tilde = h_ru @ Theta @ H_br
+        # RIS reflection (passive RIS): unit-modulus phases
+        theta = np.exp(1j * ris_phase_action)
+        Theta = np.diag(theta)
+        h_tilde = h_ru @ Theta @ H_br
 
-    # Power normalization
-    P_tx_total = np.trace(W_tau @ W_tau.conj().T + W_o @ W_o.conj().T).real
-    if P_tx_total > P_max:
-        scale = np.sqrt(P_max / P_tx_total)
-        W_tau *= scale
-        W_o *= scale
+        # Power normalization
+        P_tx_total = np.trace(W_tau @ W_tau.conj().T + W_o @ W_o.conj().T).real
+        if P_tx_total > P_max:
+            scale = np.sqrt(P_max / P_tx_total)
+            W_tau *= scale
+            W_o *= scale
 
-    # Compute eavesdropper and user SINRs (pass tuple to support amplitudes)
-    snr_eve = compute_eve_sinr_maxcase((ris_phase_action, ris_amplitude_action), W_tau, W_o)
-    snr_comm = compute_snr_delayed((ris_phase_action, ris_amplitude_action), W_tau, W_o, v_idx=0)
+        # Compute eavesdropper and user SINRs (pass phases only)
+        snr_eve = compute_eve_sinr_maxcase(ris_phase_action, W_tau, W_o)
+        snr_comm = compute_snr_delayed(ris_phase_action, W_tau, W_o, v_idx=0)
 
-    # Initialize rates
-    secrecy_rate = 0
-    R_v, R_e = 0, 0
+        # Initialize rates
+        secrecy_rate = 0
+        R_v, R_e = 0, 0
 
-    gamma_req = 0.001
+        gamma_req = 0.001
 
-    if snr_comm >= gamma_req:
-        R_v = beta * B * np.log2(1 + max(snr_comm, snr_min))
-        R_e = beta * B * np.log2(1 + max(snr_eve, snr_min))
-        C_D_i = beta * B * np.log2(1 + max(np.abs(h_backhaul)**2 / sigma2, snr_min))
-        total_Rv = R_v * V
-        R_D_v = R_v / total_Rv * C_D_i
-        R_E2E_v = min(R_v, R_D_v)
-        secrecy_rate = max(R_E2E_v - R_e, 0)
+        if snr_comm >= gamma_req:
+            R_v = beta * B * np.log2(1 + max(snr_comm, snr_min))
+            R_e = beta * B * np.log2(1 + max(snr_eve, snr_min))
+            C_D_i = beta * B * np.log2(1 + max(np.abs(h_backhaul)**2 / sigma2, snr_min))
+            total_Rv = R_v * V
+            R_D_v = R_v / total_Rv * C_D_i
+            R_E2E_v = min(R_v, R_D_v)
+            secrecy_rate = max(R_E2E_v - R_e, 0)
 
-    # Reward: pure communication secrecy
-    reward = secrecy_rate
-    reward = np.clip(reward, -10.0, 10.0)
+        # Reward: pure communication secrecy
+        reward = secrecy_rate
+        reward = np.clip(reward, -10.0, 10.0)
 
-    # KPIs for prompt
-    min_user_rate = R_E2E_v if snr_comm >= gamma_req else 0
-    rate_eve = R_e
+        # KPIs for prompt
+        min_user_rate = R_E2E_v if snr_comm >= gamma_req else 0
+        rate_eve = R_e
 
-    # Store KPIs
-    last_secrecy_rate = secrecy_rate
-    last_min_user_rate = min_user_rate
-    last_rate_eve = rate_eve
-    last_P_tx_total = P_tx_total
+        # Store KPIs
+        last_secrecy_rate = secrecy_rate
+        last_min_user_rate = min_user_rate
+        last_rate_eve = rate_eve
+        last_P_tx_total = P_tx_total
 
-    agent.reward_history.append(reward)
+        agent.reward_history.append(reward)
 
-    # Construct next state
-    prev_action_next = np.concatenate([ris_phase_action, W_tau.real.flatten(), W_tau.imag.flatten()])
-    Theta_next = np.diag(ris_amplitude_action * np.exp(1j * ris_phase_action))
-    h_tilde_next = (h_ru @ Theta_next @ H_br).reshape(1, -1)
-    h_ris_v_next = np.tile(h_tilde_next, (V_users, 1))
+        # Construct next state
+        prev_action_next = np.concatenate([ris_phase_action, W_tau.real.flatten(), W_tau.imag.flatten()])
+        Theta_next = np.diag(np.exp(1j * ris_phase_action))
+        h_tilde_next = (h_ru @ Theta_next @ H_br).reshape(1, -1)
+        h_ris_v_next = np.tile(h_tilde_next, (V_users, 1))
 
-    h_iv_next = []
-    for vv in range(V_users):
-        h_direct_v_next = ((np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)).reshape(1, -1)
-        h_iv_next.append(h_direct_v_next)
-    h_iv_next = np.vstack(h_iv_next)
+        h_iv_next = []
+        for vv in range(V_users):
+            h_direct_v_next = ((np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)).reshape(1, -1)
+            h_iv_next.append(h_direct_v_next)
+        h_iv_next = np.vstack(h_iv_next)
 
-    h_direct_e_next = (np.random.randn(1, M) + 1j * np.random.randn(1, M)) / np.sqrt(2)
-    h_ris_e_next = h_e @ Theta_next @ H_be
+        h_direct_e_next = (np.random.randn(1, M) + 1j * np.random.randn(1, M)) / np.sqrt(2)
+        h_ris_e_next = h_e @ Theta_next @ H_be
 
-    h_iv_np_next = complex_to_real_imag(h_iv_next)
-    h_is_np_next = complex_to_real_imag(H_br)
-    h_sv_np_next = complex_to_real_imag(np.tile(h_ru, (V_users, 1)))
-    h_ris_v_np_next = complex_to_real_imag(h_ris_v_next)
-    h_ie_np_next = complex_to_real_imag(h_direct_e_next)
-    h_ris_e_np_next = complex_to_real_imag(h_ris_e_next)
-    h_di_next = np.array([h_backhaul.real, h_backhaul.imag])
+        h_iv_np_next = complex_to_real_imag(h_iv_next)
+        h_is_np_next = complex_to_real_imag(H_br)
+        h_sv_np_next = complex_to_real_imag(np.tile(h_ru, (V_users, 1)))
+        h_ris_v_np_next = complex_to_real_imag(h_ris_v_next)
+        h_ie_np_next = complex_to_real_imag(h_direct_e_next)
+        h_ris_e_np_next = complex_to_real_imag(h_ris_e_next)
+        h_di_next = np.array([h_backhaul.real, h_backhaul.imag])
 
-    csi_np_next = np.concatenate([h_iv_np_next, h_is_np_next, h_sv_np_next, h_ris_v_np_next, h_ie_np_next, h_ris_e_np_next, h_di_next])
-    next_state_np = np.concatenate([prev_action_next, csi_np_next])
+        csi_np_next = np.concatenate([h_iv_np_next, h_is_np_next, h_sv_np_next, h_ris_v_np_next, h_ie_np_next, h_ris_e_np_next, h_di_next])
+        next_state_np = np.concatenate([prev_action_next, csi_np_next])
 
-    if agent.is_text_based or agent.is_hybrid:
-        next_prompt = create_descriptive_prompt(
-            secrecy_rate=secrecy_rate,
-            min_user_rate=min_user_rate,
-            rate_eve=rate_eve,
-            P_tx_total=P_tx_total,
-            P_max=P_max
-        )
-        agent.replay_buffer.push((prompt, noisy_action, [reward], next_prompt, state_np, next_state_np))
-    else:
-        agent.replay_buffer.push(state_np, noisy_action, [reward], next_state_np)
+        if agent.is_text_based or agent.is_hybrid:
+            next_prompt = create_descriptive_prompt(
+                secrecy_rate=secrecy_rate,
+                min_user_rate=min_user_rate,
+                rate_eve=rate_eve,
+                P_tx_total=P_tx_total,
+                P_max=P_max
+            )
+            agent.replay_buffer.push((prompt, noisy_action, [reward], next_prompt, state_np, next_state_np))
+        else:
+            agent.replay_buffer.push(state_np, noisy_action, [reward], next_state_np)
 
-    agent.update(batch_size, gamma, tau, tokenizer)
+        agent.update(batch_size, gamma, tau, tokenizer)
 
     # Update noise for next episode - use agent-specific parameters
     if agent.is_text_based or agent.is_hybrid:
