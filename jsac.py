@@ -155,8 +155,11 @@ def compute_snr_delayed(phases, W_tau, W_o, v_idx=0, h_direct=None):
 
 # Equation (16) & (17) - Worst-case SINR at eavesdropper (Γ_e^(c)).
 # This function calculates the maximum possible SINR the eavesdropper could achieve.
-def compute_eve_sinr_maxcase(phases, W_tau, W_o):
-    """Worst-case SINR at eavesdropper as per Gamma_e^(c)"""
+def compute_eve_sinr_maxcase(phases, W_tau, W_o, h_direct_e=None):
+    """Worst-case SINR at eavesdropper as per Gamma_e^(c).
+    If a deterministic eavesdropper direct channel `h_direct_e` is provided, use it
+    (perfect CSI). Otherwise fall back to a random draw.
+    """
     # Equation (1) - RIS diagonal reflection matrix (Θ).
     # Support hybrid RIS amplitudes if phases is a tuple (phases, amplitudes)
     if isinstance(phases, tuple) or isinstance(phases, list):
@@ -166,8 +169,9 @@ def compute_eve_sinr_maxcase(phases, W_tau, W_o):
         theta = np.exp(1j * phases)
     Theta = np.diag(theta)
 
-    # Improved eavesdropper channel modeling with more realistic variations
-    h_direct_e = (np.random.randn(1, M) + 1j * np.random.randn(1, M)) / np.sqrt(2)
+    # Use provided eavesdropper direct channel (perfect CSI) when available
+    if h_direct_e is None:
+        h_direct_e = (np.random.randn(1, M) + 1j * np.random.randn(1, M)) / np.sqrt(2)
     h_ris_e = h_e @ Theta @ H_be
     V = W_tau.shape[1]
 
@@ -478,6 +482,7 @@ state_dim = prev_action_dim + csi_dim
 # Expand action space to include amplitudes for hybrid RIS (amplitudes + phases + beamforming)
 action_dim = N + (2 * M * V_users)  # passive RIS: N phases + beamforming real/imag
 
+# i wanted to make episode an argument from command line
 import argparse
 
 # set up argument parser
@@ -570,13 +575,13 @@ for ep in range(episodes):
     # Prev action part
     prev_action_np = np.concatenate([ris_phases, bs_w_real, bs_w_imag])
 
-    # Flatten CSI components into real/imag vectors and concatenate
+    # Flatten CSI components into real/imag vectors and concatenate (perfect CSI)
     def complex_to_real_imag(x):
         x = np.array(x)
         return np.concatenate([x.real.ravel(), x.imag.ravel()])
 
     h_iv_np = complex_to_real_imag(h_iv)                # 2*M*V
-    h_is_np = complex_to_real_imag(H_br_flat)           # 2*N*M
+    h_is_np = complex_to_real_imag(H_br)                # 2*N*M
     h_sv_np = complex_to_real_imag(h_sv)                # 2*N*V
     h_ris_v_np = complex_to_real_imag(h_ris_v)          # 2*M*V
     h_ie_np = complex_to_real_imag(h_direct_e)          # 2*M
@@ -655,9 +660,6 @@ for ep in range(episodes):
         W_tau = w_real + 1j * w_imag
         W_o = W_tau.copy()
 
-        # Representative direct channel for first user (stochastic/imperfect CSI)
-        h_direct = ((np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)).T
-
         # RIS reflection (passive RIS): unit-modulus phases
         theta = np.exp(1j * ris_phase_action)
         Theta = np.diag(theta)
@@ -670,9 +672,11 @@ for ep in range(episodes):
             W_tau *= scale
             W_o *= scale
 
-        # Compute eavesdropper and user SINRs (pass phases only)
-        snr_eve = compute_eve_sinr_maxcase(ris_phase_action, W_tau, W_o)
-        snr_comm = compute_snr_delayed(ris_phase_action, W_tau, W_o, v_idx=0)
+        # Compute eavesdropper and user SINRs (pass phases only) using perfect CSI
+        # Use per-episode eavesdropper direct channel and per-user direct channel
+        snr_eve = compute_eve_sinr_maxcase(ris_phase_action, W_tau, W_o, h_direct_e=h_direct_e)
+        # compute_snr_delayed expects h_direct shape (1, M); use h_iv for the v_idx user
+        snr_comm = compute_snr_delayed(ris_phase_action, W_tau, W_o, v_idx=0, h_direct=h_iv[0].reshape(1, -1))
 
         # Initialize rates
         secrecy_rate = 0
