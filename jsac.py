@@ -484,7 +484,8 @@ h_di_dim = 2
 
 csi_dim = h_iv_dim + h_is_dim + h_sv_dim + h_ris_v_dim + h_ie_dim + h_ris_e_dim + h_di_dim
 
-state_dim = prev_action_dim + csi_dim
+# State dimension: only CSI components (no previous action)
+state_dim = csi_dim
 
 # Expand action space to include amplitudes for hybrid RIS (amplitudes + phases + beamforming)
 action_dim = N + (2 * M * V_users)  # passive RIS: N phases + beamforming real/imag
@@ -518,7 +519,7 @@ min_noise_std_mlp = 0.05  # Separate minimum noise for MLP
 llm_model_name = 'distilbert-base-uncased'
 
 # Training monitoring parameters
-avg_window_size = 100  # Number of episodes to average for performance monitoring (can be changed to 50, 60, etc.)
+avg_window_size = 50  # Number of episodes to average for performance monitoring (can be changed to 50, 60, etc.)
 
 # Initialize Tokenizer and Agents
 print("Initializing tokenizer and agents...")
@@ -596,7 +597,8 @@ for ep in range(episodes):
 
     csi_np = np.concatenate([h_iv_np, h_is_np, h_sv_np, h_ris_v_np, h_ie_np, h_ris_e_np, h_di])
 
-    state_np = np.concatenate([prev_action_np, csi_np])
+    # State now contains only perfect CSI (no prev action)
+    state_np = csi_np
 
     state_tensor = torch.FloatTensor(state_np).unsqueeze(0).to(device)
 
@@ -716,8 +718,7 @@ for ep in range(episodes):
 
         agent.reward_history.append(reward)
 
-        # Construct next state
-        prev_action_next = np.concatenate([ris_phase_action, W_tau.real.flatten(), W_tau.imag.flatten()])
+        # Construct next state (perfect CSI only)
         Theta_next = np.diag(np.exp(1j * ris_phase_action))
         h_tilde_next = (h_ru @ Theta_next @ H_br).reshape(1, -1)
         h_ris_v_next = np.tile(h_tilde_next, (V_users, 1))
@@ -740,7 +741,8 @@ for ep in range(episodes):
         h_di_next = np.array([h_backhaul.real, h_backhaul.imag])
 
         csi_np_next = np.concatenate([h_iv_np_next, h_is_np_next, h_sv_np_next, h_ris_v_np_next, h_ie_np_next, h_ris_e_np_next, h_di_next])
-        next_state_np = np.concatenate([prev_action_next, csi_np_next])
+        # Next state also only contains CSI (perfect CSI)
+        next_state_np = csi_np_next
 
         if agent.is_text_based or agent.is_hybrid:
             next_prompt = create_descriptive_prompt(
