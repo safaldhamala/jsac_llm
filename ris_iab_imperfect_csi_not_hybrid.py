@@ -1,3 +1,10 @@
+'''
+ris iab only, no isac
+imperfect CSI
+passive RIS
+'''
+
+
 
 import numpy as np
 import torch
