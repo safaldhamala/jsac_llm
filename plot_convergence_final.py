@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-def moving_avg(x, k=600):
+def moving_avg(x, k=50):
     return np.convolve(x, np.ones(k)/k, mode='valid')
 
 def plot_comparison(save_path='plots/actor_comparison.png'):
