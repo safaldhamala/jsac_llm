@@ -1,7 +1,25 @@
 '''
-ris iab only, no isac
-imperfect CSI
-passive RIS
+RIS IAB Communication System with Perfect/Imperfect CSI Comparison
+================================================================
+
+Features:
+- RIS-aided IAB communication system (no ISAC sensing)
+- Passive RIS with unit-modulus phase shifts
+- Configurable CSI quality via CSI_ERROR_VARIANCE parameter
+
+CSI Configuration:
+- Set CSI_ERROR_VARIANCE = 0.0 for Perfect CSI mode
+- Set CSI_ERROR_VARIANCE > 0.0 for Imperfect CSI mode (e.g., 0.01, 0.1)
+
+Usage:
+1. Run with Perfect CSI: python ris_iab_imperfect_csi.py --episodes 1000
+2. Edit CSI_ERROR_VARIANCE to > 0.0, then run again for Imperfect CSI
+3. The script will save results with appropriate suffixes and generate comparison plots
+
+The script implements the h_true = ĥ_estimated + error model where:
+- Agents see only estimated channels (ĥ_estimated) for decision making
+- Environment uses true channels (h_true) for reward calculation
+- This creates a realistic imperfect CSI scenario
 '''
 
 
@@ -26,10 +44,13 @@ if torch.cuda.is_available():
     print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
 # --- 1. Setup and Environment Definition ---
-# Create a directory for plots if it doesn't exist
+# Create directories for plots if they don't exist
 if not os.path.exists('plots'):
     os.makedirs('plots')
     print("Created 'plots' directory for saving results.")
+if not os.path.exists('plots/csi_comparison'):
+    os.makedirs('plots/csi_comparison')
+    print("Created 'plots/csi_comparison' directory for CSI comparison results.")
 
 # Set seed for reproducibility
 np.random.seed(42)
@@ -43,6 +64,11 @@ P_max = 1
 snr_min = 1e-8
 # omega removed - single-objective secrecy reward
 beta, B = 0.8, 1.0 #########################################################from 0.8,1.0
+
+# CSI Error Parameter - Controls channel estimation quality
+# The script will automatically run both Perfect and Imperfect CSI experiments
+CSI_ERROR_VARIANCE_PERFECT = 0.0  # Perfect CSI
+CSI_ERROR_VARIANCE_IMPERFECT = 0.1  # Imperfect CSI (adjustable)
 
 # --- IEEE-Based Multi-Link Pathloss Initialization ---
 V = 3  # Number of vehicular users
@@ -124,9 +150,13 @@ def _scalar(x): return float(np.real(x).ravel()[0])
 # SNR and Rate Computations
 # Equation (14) - Signal-to-Interference-plus-Noise Ratio (SINR) at VU v (Γ_v).
 # Calculates the SINR for a vehicular user, considering the constructively aligned signals.
-def compute_snr_delayed(phases, W_tau, W_o, v_idx=0, h_direct=None):
+def compute_snr_delayed(phases, W_tau, W_o, v_idx=0, h_direct=None, h_ru_true=None, H_br_true=None):
     if h_direct is None:
         h_direct = ((np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)).T  # Shape: (1, M)
+    
+    # Use true channels if provided (for reward calculation), otherwise use estimated channels
+    h_ru_use = h_ru_true if h_ru_true is not None else h_ru
+    H_br_use = H_br_true if H_br_true is not None else H_br
 
     # Equation (1) - RIS diagonal reflection matrix (Θ).
     # Support hybrid RIS amplitudes if phases is a tuple (phases, amplitudes)
@@ -136,7 +166,7 @@ def compute_snr_delayed(phases, W_tau, W_o, v_idx=0, h_direct=None):
     else:
         theta = np.exp(1j * phases)
     Theta = np.diag(theta)
-    h_tilde = h_ru @ Theta @ H_br  # RIS-assisted channel
+    h_tilde = h_ru_use @ Theta @ H_br_use  # RIS-assisted channel
 
     W_tau_v = W_tau[:, v_idx].reshape(-1, 1)
     W_o_v = W_o[:, v_idx].reshape(-1, 1)
@@ -162,7 +192,7 @@ def compute_snr_delayed(phases, W_tau, W_o, v_idx=0, h_direct=None):
 
 # Equation (16) & (17) - Worst-case SINR at eavesdropper (Γ_e^(c)).
 # This function calculates the maximum possible SINR the eavesdropper could achieve.
-def compute_eve_sinr_maxcase(phases, W_tau, W_o):
+def compute_eve_sinr_maxcase(phases, W_tau, W_o, h_direct_e=None, h_e_true=None, H_be_true=None):
     """Worst-case SINR at eavesdropper as per Gamma_e^(c)"""
     # Equation (1) - RIS diagonal reflection matrix (Θ).
     # Support hybrid RIS amplitudes if phases is a tuple (phases, amplitudes)
@@ -173,9 +203,14 @@ def compute_eve_sinr_maxcase(phases, W_tau, W_o):
         theta = np.exp(1j * phases)
     Theta = np.diag(theta)
 
-    # Improved eavesdropper channel modeling with more realistic variations
-    h_direct_e = (np.random.randn(1, M) + 1j * np.random.randn(1, M)) / np.sqrt(2)
-    h_ris_e = h_e @ Theta @ H_be
+    # Use true channels if provided (for reward calculation), otherwise generate/use estimated channels
+    if h_direct_e is None:
+        h_direct_e = (np.random.randn(1, M) + 1j * np.random.randn(1, M)) / np.sqrt(2)
+    
+    h_e_use = h_e_true if h_e_true is not None else h_e
+    H_be_use = H_be_true if H_be_true is not None else H_be
+    
+    h_ris_e = h_e_use @ Theta @ H_be_use
     V = W_tau.shape[1]
 
     num = 0
@@ -485,18 +520,16 @@ state_dim = prev_action_dim + csi_dim
 # Expand action space to include amplitudes for hybrid RIS (amplitudes + phases + beamforming)
 action_dim = N + (2 * M * V_users)  # passive RIS: N phases + beamforming real/imag
 
-# i wanted to make episode an argument from command line
+# Command line argument parsing
 import argparse
 
-# set up argument parser
 parser = argparse.ArgumentParser()
 parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run")
-
-# parse arguments from the command line
 args = parser.parse_args()
 
 episodes = args.episodes
-print(f"Running for {episodes} episodes...")
+print(f"Running CSI comparison experiment for {episodes} episodes each...")
+print("This will run both Perfect CSI and Imperfect CSI experiments automatically.")
 
 
 
@@ -516,6 +549,341 @@ llm_model_name = 'distilbert-base-uncased'
 # Training monitoring parameters
 avg_window_size = 100  # Number of episodes to average for performance monitoring (can be changed to 50, 60, etc.)
 
+def run_training_experiment(CSI_ERROR_VARIANCE, csi_mode_name, episodes, agents, tokenizer):
+    """Run training experiment for a specific CSI condition."""
+    print(f"\n{'='*60}")
+    print(f"Starting {csi_mode_name} training for {episodes} episodes...")
+    print(f"CSI Error Variance: {CSI_ERROR_VARIANCE}")
+    print(f"{'='*60}")
+
+    # Reset agents for fresh training
+    for name, agent in agents.items():
+        agent.reward_history.clear()
+        # Reset replay buffers
+        agent.replay_buffer = TextReplayBuffer() if agent.is_text_based or agent.is_hybrid else ReplayBuffer()
+
+    for ep in range(episodes):
+        ris_phases = np.random.uniform(0, 2*np.pi, N)
+        # FIXED: Initialize state with proper dimensions for beamforming parameters
+        bs_w_real = np.random.randn(M * V_users)
+        bs_w_imag = np.random.randn(M * V_users)
+        # Normalize beamforming parameters
+        bs_w_complex = bs_w_real + 1j * bs_w_imag
+        bs_w_complex = bs_w_complex / np.linalg.norm(bs_w_complex) * np.sqrt(P_max)
+        bs_w_real = bs_w_complex.real.flatten()
+        bs_w_imag = bs_w_complex.imag.flatten()
+
+        # === TRUE CHANNELS (used for reward calculation) ===
+        # h_iv_true: direct IAB-to-VU channels for all V users (true channels)
+        h_iv_true = []
+        for vv in range(V_users):
+            h_direct_v_true = ((np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)).reshape(1, -1)
+            h_iv_true.append(h_direct_v_true)
+        h_iv_true = np.vstack(h_iv_true)  # Shape: (V, M)
+
+        # h_is_true: H_br (N x M) - true channel
+        H_br_true = H_br.copy()
+
+        # h_sv_true: h_ru (1 x N) repeated for V users - true channel
+        h_ru_true = h_ru.copy()
+        h_sv_true = np.tile(h_ru_true, (V_users, 1))  # Shape: (V, N)
+
+        # h_ie_true and h_ris_e_true for eavesdropper - true channels
+        h_direct_e_true = (np.random.randn(1, M) + 1j * np.random.randn(1, M)) / np.sqrt(2)
+        h_e_true = h_e.copy()
+        H_be_true = H_be.copy()
+
+        # h_di_true backhaul scalar - true channel
+        h_backhaul_true = h_backhaul.copy()
+        h_di_true = np.array([h_backhaul_true.real, h_backhaul_true.imag])
+
+        # === ESTIMATED CHANNELS (used for agent state) ===
+        if CSI_ERROR_VARIANCE > 0.0:
+            # Add complex Gaussian noise to create estimated channels
+            # h_iv_est: estimated direct IAB-to-VU channels
+            h_iv_est = []
+            for vv in range(V_users):
+                noise = (np.random.randn(1, M) + 1j * np.random.randn(1, M)) * np.sqrt(CSI_ERROR_VARIANCE / 2)
+                h_iv_est.append(h_iv_true[vv:vv+1] + noise)
+            h_iv_est = np.vstack(h_iv_est)
+
+            # h_is_est: estimated H_br
+            noise_H_br = (np.random.randn(N, M) + 1j * np.random.randn(N, M)) * np.sqrt(CSI_ERROR_VARIANCE / 2)
+            H_br_est = H_br_true + noise_H_br
+
+            # h_sv_est: estimated h_ru
+            noise_h_ru = (np.random.randn(1, N) + 1j * np.random.randn(1, N)) * np.sqrt(CSI_ERROR_VARIANCE / 2)
+            h_ru_est = h_ru_true + noise_h_ru
+            h_sv_est = np.tile(h_ru_est, (V_users, 1))
+
+            # h_ie_est: estimated eavesdropper direct channel
+            noise_h_direct_e = (np.random.randn(1, M) + 1j * np.random.randn(1, M)) * np.sqrt(CSI_ERROR_VARIANCE / 2)
+            h_direct_e_est = h_direct_e_true + noise_h_direct_e
+
+            # h_e_est and H_be_est: estimated eavesdropper RIS channels
+            noise_h_e = (np.random.randn(1, N) + 1j * np.random.randn(1, N)) * np.sqrt(CSI_ERROR_VARIANCE / 2)
+            noise_H_be = (np.random.randn(N, M) + 1j * np.random.randn(N, M)) * np.sqrt(CSI_ERROR_VARIANCE / 2)
+            h_e_est = h_e_true + noise_h_e
+            H_be_est = H_be_true + noise_H_be
+
+            # h_di_est: estimated backhaul
+            noise_backhaul = (np.random.randn() + 1j * np.random.randn()) * np.sqrt(CSI_ERROR_VARIANCE / 2)
+            h_backhaul_est = h_backhaul_true + noise_backhaul
+            h_di_est = np.array([h_backhaul_est.real, h_backhaul_est.imag])
+        else:
+            # Perfect CSI: estimated channels are identical to true channels
+            h_iv_est = h_iv_true.copy()
+            H_br_est = H_br_true.copy()
+            h_ru_est = h_ru_true.copy()
+            h_sv_est = h_sv_true.copy()
+            h_direct_e_est = h_direct_e_true.copy()
+            h_e_est = h_e_true.copy()
+            H_be_est = H_be_true.copy()
+            h_backhaul_est = h_backhaul_true.copy()
+            h_di_est = h_di_true.copy()
+
+        # Build CSI summaries for agent state (using ESTIMATED channels only)
+        # h_ris_v_est: estimated h_tilde for all users (simulate using current ris_phases)
+        theta_init = np.exp(1j * ris_phases)
+        Theta_init = np.diag(theta_init)
+        h_tilde_full_est = (h_ru_est @ Theta_init @ H_br_est).reshape(1, -1)
+        h_ris_v_est = np.tile(h_tilde_full_est, (V_users, 1))  # Shape: (V, M)
+
+        # h_ris_e_est for eavesdropper (estimated)
+        h_ris_e_est = h_e_est @ Theta_init @ H_be_est
+
+        # Use estimated channels for state construction
+        h_iv = h_iv_est
+        H_br_flat = H_br_est
+        h_sv = h_sv_est
+        h_ris_v = h_ris_v_est
+        h_direct_e = h_direct_e_est
+        h_ris_e = h_ris_e_est
+        h_di = h_di_est
+
+        # Prev action part
+        prev_action_np = np.concatenate([ris_phases, bs_w_real, bs_w_imag])
+
+        # Flatten CSI components into real/imag vectors and concatenate
+        def complex_to_real_imag(x):
+            x = np.array(x)
+            return np.concatenate([x.real.ravel(), x.imag.ravel()])
+
+        h_iv_np = complex_to_real_imag(h_iv)                # 2*M*V
+        h_is_np = complex_to_real_imag(H_br_flat)           # 2*N*M
+        h_sv_np = complex_to_real_imag(h_sv)                # 2*N*V
+        h_ris_v_np = complex_to_real_imag(h_ris_v)          # 2*M*V
+        h_ie_np = complex_to_real_imag(h_direct_e)          # 2*M
+        h_ris_e_np = complex_to_real_imag(h_ris_e)          # 2*M
+
+        csi_np = np.concatenate([h_iv_np, h_is_np, h_sv_np, h_ris_v_np, h_ie_np, h_ris_e_np, h_di])
+
+        state_np = np.concatenate([prev_action_np, csi_np])
+
+        state_tensor = torch.FloatTensor(state_np).unsqueeze(0).to(device)
+
+        # Initialize default KPIs for first episode
+        if ep == 0:
+            default_kpis = {
+                'secrecy_rate': 0.5,
+                'min_user_rate': 1.0,
+                'rate_eve': 0.8,
+                'P_tx_total': 0.5,
+                'P_max': P_max
+            }
+        else:
+            # Use previous episode's KPIs for the prompt
+            default_kpis = {
+                'secrecy_rate': last_secrecy_rate,
+                'min_user_rate': last_min_user_rate,
+                'rate_eve': last_rate_eve,
+                'P_tx_total': last_P_tx_total,
+                'P_max': P_max
+            }
+
+        for name, agent in agents.items():
+            # Use different noise parameters for different agent types
+            if agent.is_text_based or agent.is_hybrid:
+                current_noise_std = noise_std
+                current_noise_decay = noise_decay
+                current_min_noise_std = min_noise_std
+            else:
+                current_noise_std = noise_std_mlp
+                current_noise_decay = noise_decay_mlp
+                current_min_noise_std = min_noise_std_mlp
+
+            # MLP uses classic DDPG - direct state input, no text processing
+            if agent.is_text_based or agent.is_hybrid:
+                # Generate descriptive prompt for LLM and Hybrid models
+                prompt = create_descriptive_prompt(
+                    secrecy_rate=default_kpis['secrecy_rate'],
+                    min_user_rate=default_kpis['min_user_rate'],
+                    rate_eve=default_kpis['rate_eve'],
+                    P_tx_total=default_kpis['P_tx_total'],
+                    P_max=default_kpis['P_max']
+                )
+                inputs = tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=256).to(device)
+            else:
+                # MLP: Classic DDPG - no text processing needed
+                # Just use the state tensor directly
+                pass
+
+            with torch.no_grad():
+                if agent.is_text_based:
+                    action = agent.actor(inputs['input_ids'], inputs['attention_mask']).cpu().numpy()[0]
+                elif agent.is_hybrid:
+                    action = agent.actor(state_tensor, inputs['input_ids'], inputs['attention_mask']).cpu().numpy()[0]
+                else:
+                    # MLP: Classic DDPG - direct state input
+                    action = agent.actor(state_tensor).cpu().numpy()[0]
+
+            noisy_action = action + np.random.normal(0, current_noise_std, action_dim)
+
+            # Extract RIS phases (passive RIS)
+            ris_phase_action = np.mod((noisy_action[:N] + 1) / 2 * 2 * np.pi, 2 * np.pi)
+
+            # Beamforming part follows after N entries
+            w_flat = noisy_action[N:]
+            w_real = w_flat[:M*V_users].reshape(M, V_users)
+            w_imag = w_flat[M*V_users:].reshape(M, V_users)
+            W_tau = w_real + 1j * w_imag
+            W_o = W_tau.copy()
+
+            # Representative direct channel for first user (stochastic/imperfect CSI)
+            h_direct = ((np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)).T
+
+            # RIS reflection (passive RIS): unit-modulus phases
+            theta = np.exp(1j * ris_phase_action)
+            Theta = np.diag(theta)
+            h_tilde = h_ru @ Theta @ H_br
+
+            # Power normalization
+            P_tx_total = np.trace(W_tau @ W_tau.conj().T + W_o @ W_o.conj().T).real
+            if P_tx_total > P_max:
+                scale = np.sqrt(P_max / P_tx_total)
+                W_tau *= scale
+                W_o *= scale
+
+            # Compute eavesdropper and user SINRs using TRUE channels for reward calculation
+            snr_eve = compute_eve_sinr_maxcase(ris_phase_action, W_tau, W_o,
+                                               h_direct_e=h_direct_e_true,
+                                               h_e_true=h_e_true,
+                                               H_be_true=H_be_true)
+
+            # Use the first user's true direct channel for legitimate user SINR
+            h_direct_user_true = h_iv_true[0:1, :]  # Shape: (1, M)
+            snr_comm = compute_snr_delayed(ris_phase_action, W_tau, W_o, v_idx=0,
+                                           h_direct=h_direct_user_true,
+                                           h_ru_true=h_ru_true,
+                                           H_br_true=H_br_true)
+
+            # Initialize rates
+            secrecy_rate = 0
+            R_v, R_e = 0, 0
+
+            gamma_req = 0.001
+
+            if snr_comm >= gamma_req:
+                R_v = beta * B * np.log2(1 + max(snr_comm, snr_min))
+                R_e = beta * B * np.log2(1 + max(snr_eve, snr_min))
+                # Use true backhaul channel for reward calculation
+                C_D_i = beta * B * np.log2(1 + max(np.abs(h_backhaul_true)**2 / sigma2, snr_min))
+                total_Rv = R_v * V
+                R_D_v = R_v / total_Rv * C_D_i
+                R_E2E_v = min(R_v, R_D_v)
+                secrecy_rate = max(R_E2E_v - R_e, 0)
+
+            # Reward: pure communication secrecy
+            reward = secrecy_rate
+            reward = np.clip(reward, -10.0, 10.0)
+
+            # KPIs for prompt
+            min_user_rate = R_E2E_v if snr_comm >= gamma_req else 0
+            rate_eve = R_e
+
+            # Store KPIs
+            last_secrecy_rate = secrecy_rate
+            last_min_user_rate = min_user_rate
+            last_rate_eve = rate_eve
+            last_P_tx_total = P_tx_total
+
+            agent.reward_history.append(reward)
+
+            # Construct next state
+            prev_action_next = np.concatenate([ris_phase_action, W_tau.real.flatten(), W_tau.imag.flatten()])
+            Theta_next = np.diag(np.exp(1j * ris_phase_action))
+            h_tilde_next = (h_ru @ Theta_next @ H_br).reshape(1, -1)
+            h_ris_v_next = np.tile(h_tilde_next, (V_users, 1))
+
+            h_iv_next = []
+            for vv in range(V_users):
+                h_direct_v_next = ((np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)).reshape(1, -1)
+                h_iv_next.append(h_direct_v_next)
+            h_iv_next = np.vstack(h_iv_next)
+
+            h_direct_e_next = (np.random.randn(1, M) + 1j * np.random.randn(1, M)) / np.sqrt(2)
+            h_ris_e_next = h_e @ Theta_next @ H_be
+
+            h_iv_np_next = complex_to_real_imag(h_iv_next)
+            h_is_np_next = complex_to_real_imag(H_br)
+            h_sv_np_next = complex_to_real_imag(np.tile(h_ru, (V_users, 1)))
+            h_ris_v_np_next = complex_to_real_imag(h_ris_v_next)
+            h_ie_np_next = complex_to_real_imag(h_direct_e_next)
+            h_ris_e_np_next = complex_to_real_imag(h_ris_e_next)
+            h_di_next = np.array([h_backhaul.real, h_backhaul.imag])
+
+            csi_np_next = np.concatenate([h_iv_np_next, h_is_np_next, h_sv_np_next, h_ris_v_np_next, h_ie_np_next, h_ris_e_np_next, h_di_next])
+            next_state_np = np.concatenate([prev_action_next, csi_np_next])
+
+            if agent.is_text_based or agent.is_hybrid:
+                next_prompt = create_descriptive_prompt(
+                    secrecy_rate=secrecy_rate,
+                    min_user_rate=min_user_rate,
+                    rate_eve=rate_eve,
+                    P_tx_total=P_tx_total,
+                    P_max=P_max
+                )
+                agent.replay_buffer.push((prompt, noisy_action, [reward], next_prompt, state_np, next_state_np))
+            else:
+                agent.replay_buffer.push(state_np, noisy_action, [reward], next_state_np)
+
+            agent.update(batch_size, gamma, tau, tokenizer)
+
+        # Update noise for next episode - use agent-specific parameters
+        if agent.is_text_based or agent.is_hybrid:
+            noise_std = max(noise_std * noise_decay, min_noise_std)
+        else:
+            noise_std_mlp = max(noise_std_mlp * noise_decay_mlp, min_noise_std_mlp)
+
+        if (ep + 1) % 100 == 0:
+            print(f"Episode {ep + 1}/{episodes} | Noise: {noise_std:.3f}")
+            for name, agent in agents.items():
+                avg_reward = np.mean(agent.reward_history[-avg_window_size:])
+                print(f"  - {name}: Last {avg_window_size} Avg Reward = {avg_reward:.4f}")
+        if ep < 10:  # for first 10 episodes
+            print(f"Ep{ep+1} | SNR_comm={snr_comm:.2e}, SNR_eve={snr_eve:.2e}, R_v={R_v:.4f}, R_e={R_e:.4f}, Secrecy={secrecy_rate:.4f}, Reward={reward:.4f}")
+
+    print(f"{csi_mode_name} training finished.")
+
+    # Save data for this CSI condition
+    csi_suffix = "perfect" if CSI_ERROR_VARIANCE == 0.0 else "imperfect"
+    print(f"Saving {csi_mode_name} reward data...")
+    for name, agent in agents.items():
+            np.save(f'plots/csi_comparison/{name}_rewards_{csi_suffix}.npy', agent.reward_history)
+
+    return agents  # Return agents with their reward histories
+
+
+# --- Main Execution: Run Both CSI Experiments ---
+print("="*80)
+print("CSI COMPARISON EXPERIMENT")
+print("="*80)
+print("This script will automatically run both Perfect and Imperfect CSI experiments.")
+print(f"Episodes per experiment: {episodes}")
+print(f"Perfect CSI variance: {CSI_ERROR_VARIANCE_PERFECT}")
+print(f"Imperfect CSI variance: {CSI_ERROR_VARIANCE_IMPERFECT}")
+print("="*80)
+
 # Initialize Tokenizer and Agents
 print("Initializing tokenizer and agents...")
 tokenizer = DistilBertTokenizer.from_pretrained(llm_model_name)
@@ -534,279 +902,91 @@ for name, agent in agents.items():
 
 print("Initialization complete.")
 
-# Training Loop
-print(f"Starting training for {episodes} episodes...")
-for ep in range(episodes):
+# Run Perfect CSI Experiment
+print("\n" + "="*60)
+print("EXPERIMENT 1: PERFECT CSI")
+print("="*60)
+agents_perfect = run_training_experiment(
+    CSI_ERROR_VARIANCE=CSI_ERROR_VARIANCE_PERFECT,
+    csi_mode_name="Perfect CSI", 
+    episodes=episodes,
+    agents=agents,
+    tokenizer=tokenizer
+)
 
-    ris_phases = np.random.uniform(0, 2*np.pi, N)
-    # FIXED: Initialize state with proper dimensions for beamforming parameters
-    bs_w_real = np.random.randn(M * V_users)
-    bs_w_imag = np.random.randn(M * V_users)
-    # Normalize beamforming parameters
-    bs_w_complex = bs_w_real + 1j * bs_w_imag
-    bs_w_complex = bs_w_complex / np.linalg.norm(bs_w_complex) * np.sqrt(P_max)
-    bs_w_real = bs_w_complex.real.flatten()
-    bs_w_imag = bs_w_complex.imag.flatten()
-    
-    # Build CSI summaries to include in the state
-    # h_iv: direct IAB-to-VU channels for all V users (simulate per-episode)
-    h_iv = []
-    for vv in range(V_users):
-        h_direct_v = ((np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)).reshape(1, -1)
-        h_iv.append(h_direct_v)
-    h_iv = np.vstack(h_iv)  # Shape: (V, M)
+# Re-initialize agents for second experiment
+print("\nRe-initializing agents for Imperfect CSI experiment...")
+agents = {
+    "MLP": DDPGAgent("MLP", ActorMLP, Critic, state_dim, action_dim),
+    "LLM": DDPGAgent("LLM", ActorLLM, Critic, state_dim, action_dim, is_text_based=True),
+    "Hybrid": DDPGAgent("Hybrid", ActorHybrid, Critic, state_dim, action_dim, is_hybrid=True)
+}
 
-    # h_is: H_br (N x M)
-    H_br_flat = H_br
+# Run Imperfect CSI Experiment
+print("\n" + "="*60)
+print("EXPERIMENT 2: IMPERFECT CSI")
+print("="*60)
+agents_imperfect = run_training_experiment(
+    CSI_ERROR_VARIANCE=CSI_ERROR_VARIANCE_IMPERFECT,
+    csi_mode_name="Imperfect CSI",
+    episodes=episodes, 
+    agents=agents,
+    tokenizer=tokenizer
+)
 
-    # h_sv: h_ru (1 x N) repeated for V users (store as V x N)
-    h_sv = np.tile(h_ru, (V_users, 1))  # Shape: (V, N)
-
-    # h_ris_v: h_tilde for all users (simulate using current ris_phases)
-    theta_init = np.exp(1j * ris_phases)
-    Theta_init = np.diag(theta_init)
-    h_tilde_full = (h_ru @ Theta_init @ H_br).reshape(1, -1)
-    h_ris_v = np.tile(h_tilde_full, (V_users, 1))  # Shape: (V, M)
-
-    # h_ie and h_ris_e for eavesdropper
-    h_direct_e = (np.random.randn(1, M) + 1j * np.random.randn(1, M)) / np.sqrt(2)
-    h_ris_e = h_e @ Theta_init @ H_be
-
-    # h_di backhaul scalar
-    h_di = np.array([h_backhaul.real, h_backhaul.imag])
-
-    # Prev action part
-    prev_action_np = np.concatenate([ris_phases, bs_w_real, bs_w_imag])
-
-    # Flatten CSI components into real/imag vectors and concatenate
-    def complex_to_real_imag(x):
-        x = np.array(x)
-        return np.concatenate([x.real.ravel(), x.imag.ravel()])
-
-    h_iv_np = complex_to_real_imag(h_iv)                # 2*M*V
-    h_is_np = complex_to_real_imag(H_br_flat)           # 2*N*M
-    h_sv_np = complex_to_real_imag(h_sv)                # 2*N*V
-    h_ris_v_np = complex_to_real_imag(h_ris_v)          # 2*M*V
-    h_ie_np = complex_to_real_imag(h_direct_e)          # 2*M
-    h_ris_e_np = complex_to_real_imag(h_ris_e)          # 2*M
-
-    csi_np = np.concatenate([h_iv_np, h_is_np, h_sv_np, h_ris_v_np, h_ie_np, h_ris_e_np, h_di])
-
-    state_np = np.concatenate([prev_action_np, csi_np])
-
-    state_tensor = torch.FloatTensor(state_np).unsqueeze(0).to(device)
-
-    # Initialize default KPIs for first episode
-    if ep == 0:
-        default_kpis = {
-            'secrecy_rate': 0.5,
-            'min_user_rate': 1.0,
-            'rate_eve': 0.8,
-            'P_tx_total': 0.5,
-            'P_max': P_max
-        }
-    else:
-        # Use previous episode's KPIs for the prompt
-        default_kpis = {
-            'secrecy_rate': last_secrecy_rate,
-            'min_user_rate': last_min_user_rate,
-            'rate_eve': last_rate_eve,
-            'P_tx_total': last_P_tx_total,
-            'P_max': P_max
-        }
-
-    for name, agent in agents.items():
-        # Use different noise parameters for different agent types
-        if agent.is_text_based or agent.is_hybrid:
-            current_noise_std = noise_std
-            current_noise_decay = noise_decay
-            current_min_noise_std = min_noise_std
-        else:
-            current_noise_std = noise_std_mlp
-            current_noise_decay = noise_decay_mlp
-            current_min_noise_std = min_noise_std_mlp
-            
-        # MLP uses classic DDPG - direct state input, no text processing
-        if agent.is_text_based or agent.is_hybrid:
-            # Generate descriptive prompt for LLM and Hybrid models
-            prompt = create_descriptive_prompt(
-                secrecy_rate=default_kpis['secrecy_rate'],
-                min_user_rate=default_kpis['min_user_rate'],
-                rate_eve=default_kpis['rate_eve'],
-                P_tx_total=default_kpis['P_tx_total'],
-                P_max=default_kpis['P_max']
-            )
-            inputs = tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=256).to(device)
-        else:
-            # MLP: Classic DDPG - no text processing needed
-            # Just use the state tensor directly
-            pass
-
-        with torch.no_grad():
-            if agent.is_text_based:
-                action = agent.actor(inputs['input_ids'], inputs['attention_mask']).cpu().numpy()[0]
-            elif agent.is_hybrid:
-                action = agent.actor(state_tensor, inputs['input_ids'], inputs['attention_mask']).cpu().numpy()[0]
-            else:
-                # MLP: Classic DDPG - direct state input
-                action = agent.actor(state_tensor).cpu().numpy()[0]
-
-        noisy_action = action + np.random.normal(0, current_noise_std, action_dim)
-
-        # Extract RIS phases (passive RIS)
-        ris_phase_action = np.mod((noisy_action[:N] + 1) / 2 * 2 * np.pi, 2 * np.pi)
-
-        # Beamforming part follows after N entries
-        w_flat = noisy_action[N:]
-        w_real = w_flat[:M*V_users].reshape(M, V_users)
-        w_imag = w_flat[M*V_users:].reshape(M, V_users)
-        W_tau = w_real + 1j * w_imag
-        W_o = W_tau.copy()
-
-        # Representative direct channel for first user (stochastic/imperfect CSI)
-        h_direct = ((np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)).T
-
-        # RIS reflection (passive RIS): unit-modulus phases
-        theta = np.exp(1j * ris_phase_action)
-        Theta = np.diag(theta)
-        h_tilde = h_ru @ Theta @ H_br
-
-        # Power normalization
-        P_tx_total = np.trace(W_tau @ W_tau.conj().T + W_o @ W_o.conj().T).real
-        if P_tx_total > P_max:
-            scale = np.sqrt(P_max / P_tx_total)
-            W_tau *= scale
-            W_o *= scale
-
-        # Compute eavesdropper and user SINRs (pass phases only)
-        snr_eve = compute_eve_sinr_maxcase(ris_phase_action, W_tau, W_o)
-        snr_comm = compute_snr_delayed(ris_phase_action, W_tau, W_o, v_idx=0)
-
-        # Initialize rates
-        secrecy_rate = 0
-        R_v, R_e = 0, 0
-
-        gamma_req = 0.001
-
-        if snr_comm >= gamma_req:
-            R_v = beta * B * np.log2(1 + max(snr_comm, snr_min))
-            R_e = beta * B * np.log2(1 + max(snr_eve, snr_min))
-            C_D_i = beta * B * np.log2(1 + max(np.abs(h_backhaul)**2 / sigma2, snr_min))
-            total_Rv = R_v * V
-            R_D_v = R_v / total_Rv * C_D_i
-            R_E2E_v = min(R_v, R_D_v)
-            secrecy_rate = max(R_E2E_v - R_e, 0)
-
-        # Reward: pure communication secrecy
-        reward = secrecy_rate
-        reward = np.clip(reward, -10.0, 10.0)
-
-        # KPIs for prompt
-        min_user_rate = R_E2E_v if snr_comm >= gamma_req else 0
-        rate_eve = R_e
-
-        # Store KPIs
-        last_secrecy_rate = secrecy_rate
-        last_min_user_rate = min_user_rate
-        last_rate_eve = rate_eve
-        last_P_tx_total = P_tx_total
-
-        agent.reward_history.append(reward)
-
-        # Construct next state
-        prev_action_next = np.concatenate([ris_phase_action, W_tau.real.flatten(), W_tau.imag.flatten()])
-        Theta_next = np.diag(np.exp(1j * ris_phase_action))
-        h_tilde_next = (h_ru @ Theta_next @ H_br).reshape(1, -1)
-        h_ris_v_next = np.tile(h_tilde_next, (V_users, 1))
-
-        h_iv_next = []
-        for vv in range(V_users):
-            h_direct_v_next = ((np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)).reshape(1, -1)
-            h_iv_next.append(h_direct_v_next)
-        h_iv_next = np.vstack(h_iv_next)
-
-        h_direct_e_next = (np.random.randn(1, M) + 1j * np.random.randn(1, M)) / np.sqrt(2)
-        h_ris_e_next = h_e @ Theta_next @ H_be
-
-        h_iv_np_next = complex_to_real_imag(h_iv_next)
-        h_is_np_next = complex_to_real_imag(H_br)
-        h_sv_np_next = complex_to_real_imag(np.tile(h_ru, (V_users, 1)))
-        h_ris_v_np_next = complex_to_real_imag(h_ris_v_next)
-        h_ie_np_next = complex_to_real_imag(h_direct_e_next)
-        h_ris_e_np_next = complex_to_real_imag(h_ris_e_next)
-        h_di_next = np.array([h_backhaul.real, h_backhaul.imag])
-
-        csi_np_next = np.concatenate([h_iv_np_next, h_is_np_next, h_sv_np_next, h_ris_v_np_next, h_ie_np_next, h_ris_e_np_next, h_di_next])
-        next_state_np = np.concatenate([prev_action_next, csi_np_next])
-
-        if agent.is_text_based or agent.is_hybrid:
-            next_prompt = create_descriptive_prompt(
-                secrecy_rate=secrecy_rate,
-                min_user_rate=min_user_rate,
-                rate_eve=rate_eve,
-                P_tx_total=P_tx_total,
-                P_max=P_max
-            )
-            agent.replay_buffer.push((prompt, noisy_action, [reward], next_prompt, state_np, next_state_np))
-        else:
-            agent.replay_buffer.push(state_np, noisy_action, [reward], next_state_np)
-
-        agent.update(batch_size, gamma, tau, tokenizer)
-
-    # Update noise for next episode - use agent-specific parameters
-    if agent.is_text_based or agent.is_hybrid:
-        noise_std = max(noise_std * noise_decay, min_noise_std)
-    else:
-        noise_std_mlp = max(noise_std_mlp * noise_decay_mlp, min_noise_std_mlp)
-
-    if (ep + 1) % 100 == 0:
-        print(f"Episode {ep + 1}/{episodes} | Noise: {noise_std:.3f}")
-        for name, agent in agents.items():
-            avg_reward = np.mean(agent.reward_history[-avg_window_size:])
-            print(f"  - {name}: Last {avg_window_size} Avg Reward = {avg_reward:.4f}")
-    if ep < 10:  # for first 10 episodes
-        print(f"Ep{ep+1} | SNR_comm={snr_comm:.2e}, SNR_eve={snr_eve:.2e}, R_v={R_v:.4f}, R_e={R_e:.4f}, Secrecy={secrecy_rate:.4f}, Reward={reward:.4f}")
-
-print("Training finished.")
-
-# --- 7. Save Data and Plot Results ---
-print("Saving reward data to 'plots' directory...")
-for name, agent in agents.items():
-    np.save(f'plots/{name}_rewards.npy', agent.reward_history)
+print("\n" + "="*80)
+print("BOTH EXPERIMENTS COMPLETED!")
+print("="*80)
+print("Results saved to 'plots/csi_comparison/' directory:")
+print("- *_rewards_perfect.npy: Perfect CSI results")
+print("- *_rewards_imperfect.npy: Imperfect CSI results")
+print("="*80)
 
 def moving_avg(x, k=50):
     return np.convolve(x, np.ones(k)/k, mode='valid')
 
-def plot_comparison(save_path='plots/actor_comparison.png'):
-    plt.figure(figsize=(12, 7))
+def plot_comparison(save_path='plots/csi_comparison/actor_comparison_csi.png'):
+    plt.figure(figsize=(14, 8))
     agent_names = ["MLP", "LLM", "Hybrid"]
-    colors = ['#1f77b4', '#2ca02c', '#d62728'] # Blue, Green, Red
+    colors = ['#1f77b4', '#2ca02c', '#d62728']  # Blue, Green, Red
+    line_styles = ['-', '--']  # Solid for Perfect, Dashed for Imperfect
+    csi_conditions = ['perfect', 'imperfect']
+    csi_labels = ['Perfect CSI', 'Imperfect CSI']
 
     for name, color in zip(agent_names, colors):
-        try:
-            rewards = np.load(f'plots/{name}_rewards.npy')
-            print(f"Loaded {name} rewards: {len(rewards)} episodes")
-            
-            # Use smaller window for moving average if data is short
-            window_size = min(50, len(rewards) // 2) if len(rewards) > 10 else 5
-            if len(rewards) > window_size:
-                smoothed_rewards = moving_avg(rewards, k=window_size)
-                plt.plot(smoothed_rewards, label=f'DDPG-{name} (smoothed)', linewidth=2.5, color=color)
-            else:
-                # Plot raw data if too short for moving average
-                plt.plot(rewards, label=f'DDPG-{name} (raw)', linewidth=2.5, color=color)
+        for csi_condition, line_style, csi_label in zip(csi_conditions, line_styles, csi_labels):
+            try:
+                rewards = np.load(f'plots/csi_comparison/{name}_rewards_{csi_condition}.npy')
+                print(f"Loaded {name} {csi_condition} CSI rewards: {len(rewards)} episodes")
                 
-        except FileNotFoundError:
-            print(f"Warning: 'plots/{name}_rewards.npy' not found. Skipping.")
+                # Use smaller window for moving average if data is short
+                window_size = min(50, len(rewards) // 2) if len(rewards) > 10 else 5
+                if len(rewards) > window_size:
+                    smoothed_rewards = moving_avg(rewards, k=window_size)
+                    plt.plot(smoothed_rewards, 
+                            label=f'DDPG-{name} ({csi_label})', 
+                            linewidth=2.5, 
+                            color=color, 
+                            linestyle=line_style)
+                else:
+                    # Plot raw data if too short for moving average
+                    plt.plot(rewards, 
+                            label=f'DDPG-{name} ({csi_label}, raw)', 
+                            linewidth=2.5, 
+                            color=color, 
+                            linestyle=line_style)
+                    
+            except FileNotFoundError:
+                print(f"Warning: 'plots/csi_comparison/{name}_rewards_{csi_condition}.npy' not found. Skipping.")
 
     plt.xlabel('Episode', fontsize=14)
-    plt.ylabel('Reward (Weighted Rate)', fontsize=14)
-    plt.title('DDPG Actor Architecture Comparison (Communication Secrecy)', fontsize=16)
-    plt.legend(fontsize=12)
-    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.ylabel('Reward (Secrecy Rate)', fontsize=14)
+    plt.title('DDPG Actor Comparison under Perfect vs. Imperfect CSI', fontsize=16)
+    plt.legend(fontsize=11, loc='best')
+    plt.grid(True, which='both', linestyle=':', linewidth=0.5, alpha=0.7)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
-    print(f"Comparison plot saved to '{save_path}'")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"CSI comparison plot saved to '{save_path}'")
     plt.show()
 
 # Generate the final comparison plot

@@ -1,9 +1,9 @@
 '''
 ris iab only, no isac
-perfect CSI
-passive RIS
+imperfect CSI
+hybrid RIS
+hybrid_ris journal paper
 '''
-# with upper bound graph
 
 
 
@@ -163,11 +163,8 @@ def compute_snr_delayed(phases, W_tau, W_o, v_idx=0, h_direct=None):
 
 # Equation (16) & (17) - Worst-case SINR at eavesdropper (Γ_e^(c)).
 # This function calculates the maximum possible SINR the eavesdropper could achieve.
-def compute_eve_sinr_maxcase(phases, W_tau, W_o, h_direct_e=None):
-    """Worst-case SINR at eavesdropper as per Gamma_e^(c).
-    If a deterministic eavesdropper direct channel `h_direct_e` is provided, use it
-    (perfect CSI). Otherwise fall back to a random draw.
-    """
+def compute_eve_sinr_maxcase(phases, W_tau, W_o):
+    """Worst-case SINR at eavesdropper as per Gamma_e^(c)"""
     # Equation (1) - RIS diagonal reflection matrix (Θ).
     # Support hybrid RIS amplitudes if phases is a tuple (phases, amplitudes)
     if isinstance(phases, tuple) or isinstance(phases, list):
@@ -177,9 +174,8 @@ def compute_eve_sinr_maxcase(phases, W_tau, W_o, h_direct_e=None):
         theta = np.exp(1j * phases)
     Theta = np.diag(theta)
 
-    # Use provided eavesdropper direct channel (perfect CSI) when available
-    if h_direct_e is None:
-        h_direct_e = (np.random.randn(1, M) + 1j * np.random.randn(1, M)) / np.sqrt(2)
+    # Improved eavesdropper channel modeling with more realistic variations
+    h_direct_e = (np.random.randn(1, M) + 1j * np.random.randn(1, M)) / np.sqrt(2)
     h_ris_e = h_e @ Theta @ H_be
     V = W_tau.shape[1]
 
@@ -485,8 +481,7 @@ h_di_dim = 2
 
 csi_dim = h_iv_dim + h_is_dim + h_sv_dim + h_ris_v_dim + h_ie_dim + h_ris_e_dim + h_di_dim
 
-# State dimension: only CSI components (no previous action)
-state_dim = csi_dim
+state_dim = prev_action_dim + csi_dim
 
 # Expand action space to include amplitudes for hybrid RIS (amplitudes + phases + beamforming)
 action_dim = N + (2 * M * V_users)  # passive RIS: N phases + beamforming real/imag
@@ -520,7 +515,7 @@ min_noise_std_mlp = 0.05  # Separate minimum noise for MLP
 llm_model_name = 'distilbert-base-uncased'
 
 # Training monitoring parameters
-avg_window_size = 50  # Number of episodes to average for performance monitoring (can be changed to 50, 60, etc.)
+avg_window_size = 100  # Number of episodes to average for performance monitoring (can be changed to 50, 60, etc.)
 
 # Initialize Tokenizer and Agents
 print("Initializing tokenizer and agents...")
@@ -584,13 +579,13 @@ for ep in range(episodes):
     # Prev action part
     prev_action_np = np.concatenate([ris_phases, bs_w_real, bs_w_imag])
 
-    # Flatten CSI components into real/imag vectors and concatenate (perfect CSI)
+    # Flatten CSI components into real/imag vectors and concatenate
     def complex_to_real_imag(x):
         x = np.array(x)
         return np.concatenate([x.real.ravel(), x.imag.ravel()])
 
     h_iv_np = complex_to_real_imag(h_iv)                # 2*M*V
-    h_is_np = complex_to_real_imag(H_br)                # 2*N*M
+    h_is_np = complex_to_real_imag(H_br_flat)           # 2*N*M
     h_sv_np = complex_to_real_imag(h_sv)                # 2*N*V
     h_ris_v_np = complex_to_real_imag(h_ris_v)          # 2*M*V
     h_ie_np = complex_to_real_imag(h_direct_e)          # 2*M
@@ -598,8 +593,7 @@ for ep in range(episodes):
 
     csi_np = np.concatenate([h_iv_np, h_is_np, h_sv_np, h_ris_v_np, h_ie_np, h_ris_e_np, h_di])
 
-    # State now contains only perfect CSI (no prev action)
-    state_np = csi_np
+    state_np = np.concatenate([prev_action_np, csi_np])
 
     state_tensor = torch.FloatTensor(state_np).unsqueeze(0).to(device)
 
@@ -670,6 +664,9 @@ for ep in range(episodes):
         W_tau = w_real + 1j * w_imag
         W_o = W_tau.copy()
 
+        # Representative direct channel for first user (stochastic/imperfect CSI)
+        h_direct = ((np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)).T
+
         # RIS reflection (passive RIS): unit-modulus phases
         theta = np.exp(1j * ris_phase_action)
         Theta = np.diag(theta)
@@ -682,11 +679,9 @@ for ep in range(episodes):
             W_tau *= scale
             W_o *= scale
 
-        # Compute eavesdropper and user SINRs (pass phases only) using perfect CSI
-        # Use per-episode eavesdropper direct channel and per-user direct channel
-        snr_eve = compute_eve_sinr_maxcase(ris_phase_action, W_tau, W_o, h_direct_e=h_direct_e)
-        # compute_snr_delayed expects h_direct shape (1, M); use h_iv for the v_idx user
-        snr_comm = compute_snr_delayed(ris_phase_action, W_tau, W_o, v_idx=0, h_direct=h_iv[0].reshape(1, -1))
+        # Compute eavesdropper and user SINRs (pass phases only)
+        snr_eve = compute_eve_sinr_maxcase(ris_phase_action, W_tau, W_o)
+        snr_comm = compute_snr_delayed(ris_phase_action, W_tau, W_o, v_idx=0)
 
         # Initialize rates
         secrecy_rate = 0
@@ -719,7 +714,8 @@ for ep in range(episodes):
 
         agent.reward_history.append(reward)
 
-        # Construct next state (perfect CSI only)
+        # Construct next state
+        prev_action_next = np.concatenate([ris_phase_action, W_tau.real.flatten(), W_tau.imag.flatten()])
         Theta_next = np.diag(np.exp(1j * ris_phase_action))
         h_tilde_next = (h_ru @ Theta_next @ H_br).reshape(1, -1)
         h_ris_v_next = np.tile(h_tilde_next, (V_users, 1))
@@ -742,8 +738,7 @@ for ep in range(episodes):
         h_di_next = np.array([h_backhaul.real, h_backhaul.imag])
 
         csi_np_next = np.concatenate([h_iv_np_next, h_is_np_next, h_sv_np_next, h_ris_v_np_next, h_ie_np_next, h_ris_e_np_next, h_di_next])
-        # Next state also only contains CSI (perfect CSI)
-        next_state_np = csi_np_next
+        next_state_np = np.concatenate([prev_action_next, csi_np_next])
 
         if agent.is_text_based or agent.is_hybrid:
             next_prompt = create_descriptive_prompt(
