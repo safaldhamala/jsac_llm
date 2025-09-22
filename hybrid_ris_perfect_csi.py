@@ -1,10 +1,9 @@
-"""
-ris iab no isac
-imperfect csi
-passive ris
-"""
-
-
+'''
+ris iab only, no isac
+perfect CSI
+hybrid RIS
+hybrid_ris conference paper
+'''
 
 import numpy as np
 import torch
@@ -47,10 +46,12 @@ snr_min = 1e-8
 # omega removed - single-objective secrecy reward
 beta, B = 0.8, 1.0 #########################################################from 0.8,1.0
 
+# Hybrid RIS Parameter - Maximum amplitude gain for active RIS elements
+alpha_max = 4.0  # Maximum amplitude gain of 4 (approximately 6 dB)
+
 # CSI Error Parameter - Controls channel estimation quality
-# The script will automatically run both Perfect and Imperfect CSI experiments
-CSI_ERROR_VARIANCE_PERFECT = 0.0  # Perfect CSI
-CSI_ERROR_VARIANCE_IMPERFECT = 0.1  # Imperfect CSI (adjustable)
+# The script runs with Perfect CSI only
+CSI_ERROR_VARIANCE = 0.0  # Perfect CSI
 
 # --- IEEE-Based Multi-Link Pathloss Initialization ---
 V = 3  # Number of vehicular users
@@ -476,8 +477,8 @@ class DDPGAgent:
 # LLM/Hybrid: Conservative learning (5e-5, 1e-4), small batches (16), tight gradients (0.3), slow updates (tau=0.0005)
 # MLP: Standard learning (1e-3), larger batches (32), normal gradients (0.5), faster updates (tau=0.001)
 # This strategy aims to prevent LLM overfitting while maintaining MLP competitiveness
-# Previous Action (RIS phases + W real/imag)
-prev_action_dim = N + (2 * M * V_users)
+# Previous Action (RIS phases + RIS amplitudes + W real/imag)
+prev_action_dim = N + N + (2 * M * V_users)
 
 # Channel State Information dimensions
 # h_iv: direct IAB-to-VU channels (real+imag for M x V)
@@ -499,8 +500,8 @@ csi_dim = h_iv_dim + h_is_dim + h_sv_dim + h_ris_v_dim + h_ie_dim + h_ris_e_dim 
 
 state_dim = prev_action_dim + csi_dim
 
-# Expand action space to include amplitudes for hybrid RIS (amplitudes + phases + beamforming)
-action_dim = N + (2 * M * V_users)  # passive RIS: N phases + beamforming real/imag
+# Expand action space to include amplitudes for hybrid RIS (phases + amplitudes + beamforming)
+action_dim = N + N + (2 * M * V_users)  # hybrid RIS: N phases + N amplitudes + beamforming real/imag
 
 # Command line argument parsing
 import argparse
@@ -510,8 +511,8 @@ parser.add_argument("--episodes", type=int, default=1000, help="Number of episod
 args = parser.parse_args()
 
 episodes = args.episodes
-print(f"Running CSI comparison experiment for {episodes} episodes each...")
-print("This will run both Perfect CSI and Imperfect CSI experiments automatically.")
+print(f"Running Perfect CSI experiment for {episodes} episodes...")
+print("This will run with Perfect CSI only.")
 
 
 
@@ -546,6 +547,8 @@ def run_training_experiment(CSI_ERROR_VARIANCE, csi_mode_name, episodes, agents,
 
     for ep in range(episodes):
         ris_phases = np.random.uniform(0, 2*np.pi, N)
+        # Initialize RIS amplitudes for hybrid RIS
+        ris_amplitudes = np.random.uniform(1.0, alpha_max, N)
         # FIXED: Initialize state with proper dimensions for beamforming parameters
         bs_w_real = np.random.randn(M * V_users)
         bs_w_imag = np.random.randn(M * V_users)
@@ -625,8 +628,8 @@ def run_training_experiment(CSI_ERROR_VARIANCE, csi_mode_name, episodes, agents,
             h_di_est = h_di_true.copy()
 
         # Build CSI summaries for agent state (using ESTIMATED channels only)
-        # h_ris_v_est: estimated h_tilde for all users (simulate using current ris_phases)
-        theta_init = np.exp(1j * ris_phases)
+        # h_ris_v_est: estimated h_tilde for all users (simulate using current ris_phases and amplitudes)
+        theta_init = ris_amplitudes * np.exp(1j * ris_phases)
         Theta_init = np.diag(theta_init)
         h_tilde_full_est = (h_ru_est @ Theta_init @ H_br_est).reshape(1, -1)
         h_ris_v_est = np.tile(h_tilde_full_est, (V_users, 1))  # Shape: (V, M)
@@ -644,7 +647,7 @@ def run_training_experiment(CSI_ERROR_VARIANCE, csi_mode_name, episodes, agents,
         h_di = h_di_est
 
         # Prev action part
-        prev_action_np = np.concatenate([ris_phases, bs_w_real, bs_w_imag])
+        prev_action_np = np.concatenate([ris_phases, ris_amplitudes, bs_w_real, bs_w_imag])
 
         # Flatten CSI components into real/imag vectors and concatenate
         def complex_to_real_imag(x):
@@ -721,11 +724,17 @@ def run_training_experiment(CSI_ERROR_VARIANCE, csi_mode_name, episodes, agents,
 
             noisy_action = action + np.random.normal(0, current_noise_std, action_dim)
 
-            # Extract RIS phases (passive RIS)
+            # Extract RIS phases and amplitudes (Hybrid RIS)
+            # Phases are in the first N elements
             ris_phase_action = np.mod((noisy_action[:N] + 1) / 2 * 2 * np.pi, 2 * np.pi)
 
-            # Beamforming part follows after N entries
-            w_flat = noisy_action[N:]
+            # Amplitudes are in the next N elements
+            # Scale actor output from [-1, 1] to [1, alpha_max]
+            # (x + 1) / 2 maps [-1, 1] to [0, 1]. Then scale and shift.
+            ris_amplitude_action = 1.0 + ((noisy_action[N:2*N] + 1) / 2) * (alpha_max - 1.0)
+
+            # Beamforming part follows after 2*N entries
+            w_flat = noisy_action[2*N:]
             w_real = w_flat[:M*V_users].reshape(M, V_users)
             w_imag = w_flat[M*V_users:].reshape(M, V_users)
             W_tau = w_real + 1j * w_imag
@@ -734,8 +743,8 @@ def run_training_experiment(CSI_ERROR_VARIANCE, csi_mode_name, episodes, agents,
             # Representative direct channel for first user (stochastic/imperfect CSI)
             h_direct = ((np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)).T
 
-            # RIS reflection (passive RIS): unit-modulus phases
-            theta = np.exp(1j * ris_phase_action)
+            # RIS reflection (Hybrid RIS): amplitudes and phases
+            theta = ris_amplitude_action * np.exp(1j * ris_phase_action)
             Theta = np.diag(theta)
             h_tilde = h_ru @ Theta @ H_br
 
@@ -747,14 +756,15 @@ def run_training_experiment(CSI_ERROR_VARIANCE, csi_mode_name, episodes, agents,
                 W_o *= scale
 
             # Compute eavesdropper and user SINRs using TRUE channels for reward calculation
-            snr_eve = compute_eve_sinr_maxcase(ris_phase_action, W_tau, W_o,
+            hybrid_ris_config = (ris_phase_action, ris_amplitude_action)
+            snr_eve = compute_eve_sinr_maxcase(hybrid_ris_config, W_tau, W_o,
                                                h_direct_e=h_direct_e_true,
                                                h_e_true=h_e_true,
                                                H_be_true=H_be_true)
 
             # Use the first user's true direct channel for legitimate user SINR
             h_direct_user_true = h_iv_true[0:1, :]  # Shape: (1, M)
-            snr_comm = compute_snr_delayed(ris_phase_action, W_tau, W_o, v_idx=0,
+            snr_comm = compute_snr_delayed(hybrid_ris_config, W_tau, W_o, v_idx=0,
                                            h_direct=h_direct_user_true,
                                            h_ru_true=h_ru_true,
                                            H_br_true=H_br_true)
@@ -792,8 +802,8 @@ def run_training_experiment(CSI_ERROR_VARIANCE, csi_mode_name, episodes, agents,
             agent.reward_history.append(reward)
 
             # Construct next state
-            prev_action_next = np.concatenate([ris_phase_action, W_tau.real.flatten(), W_tau.imag.flatten()])
-            Theta_next = np.diag(np.exp(1j * ris_phase_action))
+            prev_action_next = np.concatenate([ris_phase_action, ris_amplitude_action, W_tau.real.flatten(), W_tau.imag.flatten()])
+            Theta_next = np.diag(ris_amplitude_action * np.exp(1j * ris_phase_action))
             h_tilde_next = (h_ru @ Theta_next @ H_br).reshape(1, -1)
             h_ris_v_next = np.tile(h_tilde_next, (V_users, 1))
 
@@ -856,14 +866,13 @@ def run_training_experiment(CSI_ERROR_VARIANCE, csi_mode_name, episodes, agents,
     return agents  # Return agents with their reward histories
 
 
-# --- Main Execution: Run Both CSI Experiments ---
+# --- Main Execution: Run Perfect CSI Experiment ---
 print("="*80)
-print("CSI COMPARISON EXPERIMENT")
+print("PERFECT CSI EXPERIMENT")
 print("="*80)
-print("This script will automatically run both Perfect and Imperfect CSI experiments.")
-print(f"Episodes per experiment: {episodes}")
-print(f"Perfect CSI variance: {CSI_ERROR_VARIANCE_PERFECT}")
-print(f"Imperfect CSI variance: {CSI_ERROR_VARIANCE_IMPERFECT}")
+print("This script will run with Perfect CSI only.")
+print(f"Episodes: {episodes}")
+print(f"CSI Error Variance: {CSI_ERROR_VARIANCE}")
 print("="*80)
 
 # Initialize Tokenizer and Agents
@@ -886,89 +895,62 @@ print("Initialization complete.")
 
 # Run Perfect CSI Experiment
 print("\n" + "="*60)
-print("EXPERIMENT 1: PERFECT CSI")
+print("STARTING PERFECT CSI TRAINING")
 print("="*60)
-agents_perfect = run_training_experiment(
-    CSI_ERROR_VARIANCE=CSI_ERROR_VARIANCE_PERFECT,
+agents_trained = run_training_experiment(
+    CSI_ERROR_VARIANCE=CSI_ERROR_VARIANCE,
     csi_mode_name="Perfect CSI", 
     episodes=episodes,
     agents=agents,
     tokenizer=tokenizer
 )
 
-# Re-initialize agents for second experiment
-print("\nRe-initializing agents for Imperfect CSI experiment...")
-agents = {
-    "MLP": DDPGAgent("MLP", ActorMLP, Critic, state_dim, action_dim),
-    "LLM": DDPGAgent("LLM", ActorLLM, Critic, state_dim, action_dim, is_text_based=True),
-    "Hybrid": DDPGAgent("Hybrid", ActorHybrid, Critic, state_dim, action_dim, is_hybrid=True)
-}
-
-# Run Imperfect CSI Experiment
-print("\n" + "="*60)
-print("EXPERIMENT 2: IMPERFECT CSI")
-print("="*60)
-agents_imperfect = run_training_experiment(
-    CSI_ERROR_VARIANCE=CSI_ERROR_VARIANCE_IMPERFECT,
-    csi_mode_name="Imperfect CSI",
-    episodes=episodes, 
-    agents=agents,
-    tokenizer=tokenizer
-)
-
 print("\n" + "="*80)
-print("BOTH EXPERIMENTS COMPLETED!")
+print("PERFECT CSI EXPERIMENT COMPLETED!")
 print("="*80)
 print("Results saved to 'plots/csi_comparison/' directory:")
 print("- *_rewards_perfect.npy: Perfect CSI results")
-print("- *_rewards_imperfect.npy: Imperfect CSI results")
 print("="*80)
 
 def moving_avg(x, k=50):
     return np.convolve(x, np.ones(k)/k, mode='valid')
 
-def plot_comparison(save_path='plots/csi_comparison/actor_comparison_csi.png'):
+def plot_comparison(save_path='plots/csi_comparison/actor_comparison_perfect_csi.png'):
     plt.figure(figsize=(14, 8))
     agent_names = ["MLP", "LLM", "Hybrid"]
     colors = ['#1f77b4', '#2ca02c', '#d62728']  # Blue, Green, Red
-    line_styles = ['-', '--']  # Solid for Perfect, Dashed for Imperfect
-    csi_conditions = ['perfect', 'imperfect']
-    csi_labels = ['Perfect CSI', 'Imperfect CSI']
 
     for name, color in zip(agent_names, colors):
-        for csi_condition, line_style, csi_label in zip(csi_conditions, line_styles, csi_labels):
-            try:
-                rewards = np.load(f'plots/csi_comparison/{name}_rewards_{csi_condition}.npy')
-                print(f"Loaded {name} {csi_condition} CSI rewards: {len(rewards)} episodes")
+        try:
+            rewards = np.load(f'plots/csi_comparison/{name}_rewards_perfect.npy')
+            print(f"Loaded {name} Perfect CSI rewards: {len(rewards)} episodes")
+            
+            # Use smaller window for moving average if data is short
+            window_size = min(50, len(rewards) // 2) if len(rewards) > 10 else 5
+            if len(rewards) > window_size:
+                smoothed_rewards = moving_avg(rewards, k=window_size)
+                plt.plot(smoothed_rewards, 
+                        label=f'DDPG-{name}', 
+                        linewidth=2.5, 
+                        color=color)
+            else:
+                # Plot raw data if too short for moving average
+                plt.plot(rewards, 
+                        label=f'DDPG-{name} (raw)', 
+                        linewidth=2.5, 
+                        color=color)
                 
-                # Use smaller window for moving average if data is short
-                window_size = min(50, len(rewards) // 2) if len(rewards) > 10 else 5
-                if len(rewards) > window_size:
-                    smoothed_rewards = moving_avg(rewards, k=window_size)
-                    plt.plot(smoothed_rewards, 
-                            label=f'DDPG-{name} ({csi_label})', 
-                            linewidth=2.5, 
-                            color=color, 
-                            linestyle=line_style)
-                else:
-                    # Plot raw data if too short for moving average
-                    plt.plot(rewards, 
-                            label=f'DDPG-{name} ({csi_label}, raw)', 
-                            linewidth=2.5, 
-                            color=color, 
-                            linestyle=line_style)
-                    
-            except FileNotFoundError:
-                print(f"Warning: 'plots/csi_comparison/{name}_rewards_{csi_condition}.npy' not found. Skipping.")
+        except FileNotFoundError:
+            print(f"Warning: 'plots/csi_comparison/{name}_rewards_perfect.npy' not found. Skipping.")
 
     plt.xlabel('Episode', fontsize=14)
     plt.ylabel('Reward (Secrecy Rate)', fontsize=14)
-    plt.title('DDPG Actor Comparison under Perfect vs. Imperfect CSI', fontsize=16)
+    plt.title('DDPG Actor Comparison under Perfect CSI', fontsize=16)
     plt.legend(fontsize=11, loc='best')
     plt.grid(True, which='both', linestyle=':', linewidth=0.5, alpha=0.7)
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"CSI comparison plot saved to '{save_path}'")
+    print(f"Perfect CSI comparison plot saved to '{save_path}'")
     plt.show()
 
 # Generate the final comparison plot
