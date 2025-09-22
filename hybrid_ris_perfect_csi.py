@@ -922,7 +922,7 @@ def plot_comparison(save_path='plots/csi_comparison/actor_comparison_perfect_csi
 
     for name, color in zip(agent_names, colors):
         try:
-            rewards = np.load(f'plots/csi_comparison/{name}_rewards_perfect.npy')
+            rewards = np.load(f'plots/hybrid_ris_perfect_csi/{name}_rewards_perfect.npy')
             print(f"Loaded {name} Perfect CSI rewards: {len(rewards)} episodes")
             
             # Use smaller window for moving average if data is short

@@ -937,7 +937,7 @@ print("="*80)
 def moving_avg(x, k=50):
     return np.convolve(x, np.ones(k)/k, mode='valid')
 
-def plot_comparison(save_path='plots/csi_comparison/actor_comparison_csi.png'):
+def plot_comparison(save_path='plots/hybrid_ris_imperfect/actor_comparison_csi.png'):
     plt.figure(figsize=(14, 8))
     agent_names = ["MLP", "LLM", "Hybrid"]
     colors = ['#1f77b4', '#2ca02c', '#d62728']  # Blue, Green, Red
